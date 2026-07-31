@@ -1,0 +1,23 @@
+services:
+  daily-report-backend:
+    image: daily-report-backend:latest
+    container_name: daily-report-backend
+    restart: always
+    volumes:
+      - ../config/config.yaml:/app/backend/config/config.yaml:ro
+      - ../config/llm_api_key:/app/backend/config/llm_api_key:ro
+      - ../storage:/app/storage
+    expose:
+      - "8000"
+
+  daily-report-web:
+    image: nginx:alpine
+    container_name: daily-report-web
+    restart: always
+    depends_on:
+      - daily-report-backend
+    ports:
+      - "80:80"
+    volumes:
+      - ../frontend:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro

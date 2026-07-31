@@ -1,0 +1,50 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.pytest_tmp/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Real configuration and secrets (keep *.example files tracked)
+config/config.yaml
+config/llm_api_key
+backend/config/config.yaml
+backend/config/llm_api_key
+
+# Runtime databases, logs, uploads, exports, and generated business data
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+storage/**
+!storage/.gitkeep
+
+# Downloaded/offline binary dependencies (keep their README files tracked)
+wheelhouse/*.whl
+vendor/jplag/*.jar
+*.tar
+*.tar.gz
+
+# Editor, OS, and temporary files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+~$*
+*.tmp
+*.temp
+*.bak
+*.swp

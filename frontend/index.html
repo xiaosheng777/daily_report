@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>日报核验系统</title>
+  <link rel="stylesheet" href="/styles.css?v=20260731-navfix" />
+</head>
+<body>
+  <section class="login-panel" id="loginPanel">
+    <div class="login-card">
+      <form id="loginForm">
+        <p class="eyebrow">Daily Report</p><h1>日报核验登录</h1>
+        <label><span>账号</span><input name="username" required autocomplete="username" /></label>
+        <label><span>密码</span><input name="password" required type="password" autocomplete="current-password" /></label>
+        <button class="primary" type="submit">登录</button>
+        <button class="link-button" type="button" id="showRegister">注册员工账号</button>
+        <p id="loginMessage" class="message"></p>
+      </form>
+      <form id="registerForm" class="hidden">
+        <h2>注册员工账号</h2>
+        <label><span>账号</span><input name="username" required /></label>
+        <label><span>密码</span><input name="password" required type="password" /></label>
+        <label><span>姓名</span><input name="display_name" required /></label>
+        <label><span>部门</span><select name="department_id" id="registerDepartment" required></select></label>
+        <label><span>小组</span><select name="group_id" id="registerGroup" required></select></label>
+        <button class="secondary" type="submit">注册</button>
+        <button class="link-button" type="button" id="showLogin">返回登录</button>
+        <p id="registerMessage" class="message"></p>
+      </form>
+    </div>
+  </section>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">DR</span><span>日报核验</span></div>
+      <nav class="tabs">
+        <button class="tab business-only active" data-panel="employee">日报录入</button>
+        <button class="tab business-only" data-panel="myReports">日报记录</button>
+        <button class="tab business-only" data-panel="periodicReports">周报月报</button>
+        <button class="tab manager-only" data-panel="manager">查重任务</button>
+        <button class="tab manager-only" data-panel="taskHistory">查重记录</button>
+        <button class="tab manager-only" data-panel="snapshots">测试总表</button>
+        <button class="tab admin-only" data-panel="admin">系统管理</button>
+      </nav>
+      <div class="org-chain" id="orgChain"></div>
+      <div class="status-pill" id="statusPill">未登录</div>
+      <button class="secondary logout-button" id="logoutButton">退出</button>
+    </aside>
+
+    <main>
+      <section class="panel active" id="employee">
+        <header class="panel-head"><div><p class="eyebrow">Report Entry</p><h1>日报录入</h1></div><button class="secondary" id="resetForm" type="button">清空内容</button></header>
+        <form id="reportForm" class="report-form">
+          <label><span>姓名</span><input name="name" readonly /></label>
+          <label><span>职务</span><input name="role_text" readonly /></label>
+          <label><span>部门</span><input name="department" readonly /></label>
+          <label><span>小组</span><input name="group" readonly /></label>
+          <label><span>日期</span><input name="date" required type="date" title="测试期间可手动选择日报日期" /></label>
+          <label><span>直属领导</span><input name="manager" placeholder="组织未完善时请手工填写" /></label>
+          <label class="wide"><span>标题总结</span><input name="title_summary" required placeholder="完成订单导出接口联调" /></label>
+          <label class="wide"><span>工作描述</span><textarea name="work_description" required rows="7" placeholder="描述今天完成的工作、产出和下一步。"></textarea></label>
+          <div class="wide simple-block">
+            <div class="section-head"><span>测试用例相关工作</span></div>
+            <label class="file-pair"><span>当日个人测试用例 Excel（可选）</span><input type="file" id="testcaseFiles" accept=".xlsx" /></label>
+            <p class="small-note">上传 .xlsx，系统读取名为「日报」的 sheet，作为本人当日测试用例依据；并与组长上传的小组汇总表对照。</p>
+          </div>
+          <div class="wide simple-block">
+            <div class="section-head"><span>代码相关工作</span><button class="secondary" type="button" id="addCodeRow">新增一行</button></div>
+            <div class="table-wrap"><table><thead><tr><th>文件名</th><th>语言</th><th>类型</th><th>说明</th><th></th></tr></thead><tbody id="codeBody"></tbody></table></div>
+            <label class="file-pair"><span>代码附件（可选）</span><input type="file" id="codeFiles" multiple /></label>
+          </div>
+          <div class="wide simple-block">
+            <div class="section-head"><span>文档相关工作</span><button class="secondary" type="button" id="addDocumentRow">新增一行</button></div>
+            <div class="table-wrap"><table><thead><tr><th>文档名</th><th>类型</th><th>工作类型</th><th>说明</th><th></th></tr></thead><tbody id="documentBody"></tbody></table></div>
+            <label class="file-pair"><span>文档附件（可选）</span><input type="file" id="documentFiles" multiple /></label>
+          </div>
+          <div class="form-actions wide"><button class="primary" id="submitReport" type="submit">提交日报</button><button class="secondary hidden" id="cancelReportEdit" type="button">取消更改</button><p id="formMessage" class="message"></p></div>
+        </form>
+      </section>
+
+      <section class="panel" id="myReports">
+        <header class="panel-head"><div><p class="eyebrow">Report Archive</p><h1>日报提交记录</h1></div><button class="secondary" id="exportWord" type="button">导出筛选结果</button></header>
+        <div class="toolbar report-filters"><input id="reportName" placeholder="按姓名搜索" /><input id="reportStart" type="date" title="开始日期" /><input id="reportEnd" type="date" title="结束日期" /><select id="reportRole"><option value="">全部</option></select><button class="secondary" id="refreshMyReports">查询</button></div>
+        <div class="card"><div class="table-wrap"><table><thead><tr><th>日期</th><th>提交时间</th><th>姓名</th><th>职务</th><th>部门 / 小组</th><th>标题</th><th>状态</th><th>附件</th><th>操作</th></tr></thead><tbody id="myReportList"></tbody></table></div></div>
+      </section>
+
+      <section class="panel" id="periodicReports">
+        <header class="panel-head"><div><p class="eyebrow">Periodic Report Export</p><h1>周报月报</h1><p class="small-note">按当前账号权限导出：员工本人、组长本组、主任本部门、部长全公司。</p></div></header>
+        <section class="card">
+          <form id="periodicExportForm" class="task-form">
+            <label><span>报表类型</span><select name="report_type"><option value="weekly">周报</option><option value="monthly">月报</option></select></label>
+            <label><span>开始日期</span><input name="start" type="date" required /></label>
+            <label><span>结束日期</span><input name="end" type="date" required /></label>
+            <div class="form-actions"><button class="secondary" type="submit" data-periodic-format="docx">导出 Word</button><button class="primary" type="submit" data-periodic-format="xlsx">导出 Excel</button></div>
+            <p id="periodicExportMessage" class="message"></p>
+          </form>
+        </section>
+      </section>
+
+      <section class="panel" id="manager">
+        <header class="panel-head"><div><p class="eyebrow">Duplicate Review</p><h1>查重任务与结果</h1></div><div class="task-actions"><button class="secondary" id="clearTaskDisplay">清空任务显示</button><button class="primary" id="runCheck">快速运行</button></div></header>
+        <div class="metric-grid"><div class="metric"><span>本次日报</span><strong id="resultCount">-</strong></div><div class="metric danger"><span>高风险</span><strong id="highRiskCount">-</strong></div><div class="metric"><span>错误数</span><strong id="errorCount">-</strong></div><div class="metric"><span>可见日报</span><strong id="inputCount">-</strong></div></div>
+        <form id="taskForm" class="task-form">
+          <label><span>开始日期</span><input name="report_date_start" type="date" required /></label><label><span>结束日期</span><input name="report_date_end" type="date" required /></label><label><span>部门范围</span><select name="department_scope" id="departmentScope"></select></label><label><span>员工范围</span><input name="employee_scope" placeholder="留空表示权限范围内全部" /></label><button class="primary" type="submit">创建查重任务</button><p id="taskMessage" class="message" role="status" aria-live="polite"></p>
+        </form>
+        <div class="toolbar"><input id="taskStart" type="date" /><input id="taskEnd" type="date" /><select id="taskStatus"><option value="">全部状态</option><option value="finished">完成</option><option value="failed">失败</option><option value="running">运行中</option></select><button class="secondary" id="refreshTasks">刷新任务</button></div>
+        <div class="table-wrap compact"><table><thead><tr><th>任务</th><th>状态</th><th>摘要</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="taskList"></tbody></table></div>
+          <div class="result-heading"><strong id="selectedTaskLabel">最近一次任务结果</strong></div>
+          <div class="toolbar"><input id="searchBox" placeholder="搜索姓名、部门、日期、原因" /><input id="dateFilter" type="date" /><select id="riskFilter"><option value="">全部风险</option><option value="high">高风险</option><option value="medium">中风险</option><option value="low">低风险</option><option value="normal">正常</option><option value="unknown">未知</option></select></div>
+          <div id="reviewCaseList" class="case-list"></div>
+          <div class="result-heading"><strong id="missingReportLabel">缺报人员</strong></div>
+          <div class="card table-wrap compact"><table><thead><tr><th>日期</th><th>姓名</th><th>职务</th><th>部门 / 小组</th></tr></thead><tbody id="missingReportList"></tbody></table></div>
+      </section>
+
+      <section class="panel" id="taskHistory">
+        <header class="panel-head"><div><p class="eyebrow">Task Archive</p><h1>我的查重记录</h1><p class="small-note">这里只显示你创建的任务；任务页清空显示不会删除这里的记录。</p></div><button class="secondary" id="refreshTaskHistory">刷新</button></header>
+        <div class="card table-wrap compact"><table><thead><tr><th>任务</th><th>状态</th><th>摘要</th><th>创建时间</th><th>下载与操作</th></tr></thead><tbody id="taskHistoryList"></tbody></table></div>
+      </section>
+
+      <section class="panel" id="snapshots">
+        <header class="panel-head"><div><p class="eyebrow">Testcase Snapshot</p><h1>小组测试用例汇总</h1></div><button class="secondary" id="refreshSnapshots">刷新</button></header>
+        <section class="card">
+          <form id="snapshotForm" class="snapshot-row uploader-only">
+            <label><span>快照日期</span><input type="date" name="snapshot_date" required /></label>
+            <label id="snapshotGroupWrap"><span>小组</span><select name="group_id" id="snapshotGroup"></select></label>
+            <label><span>Excel 汇总表</span><input type="file" id="snapshotFile" accept=".xlsx" required /></label>
+            <button class="primary" type="submit">上传 / 替换</button>
+            <p id="snapshotMessage" class="message"></p>
+          </form>
+          <p class="small-note">组长上传本小组当天汇总（应覆盖组员当日全部用例）；主任可选择本部门下小组上传。Excel 需含 sheet「日报」。</p>
+          <div class="table-wrap compact"><table><thead><tr><th>部门</th><th>小组</th><th>日期</th><th>文件</th><th>上传时间</th><th>操作</th></tr></thead><tbody id="snapshotList"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="panel" id="admin">
+        <header class="panel-head"><div><p class="eyebrow">System Administration</p><h1>系统管理</h1></div></header>
+        <div class="admin-grid">
+          <section class="card"><h2>账号与组织归属</h2><form id="userForm" class="admin-form"><input name="username" placeholder="账号" required /><input name="password" placeholder="初始密码" /><input name="display_name" placeholder="姓名" required /><select name="role" id="userRole"><option value="employee">员工</option><option value="group_leader">组长</option><option value="director">主任</option><option value="minister">部长</option><option value="admin">管理员</option></select><select name="department_id" id="userDepartment"></select><select name="group_id" id="userGroup"></select><button class="secondary">新增账号</button></form><p id="userMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>账号</th><th>姓名</th><th>职务</th><th>部门</th><th>小组</th><th>直属领导</th><th>状态</th><th>操作</th></tr></thead><tbody id="userList"></tbody></table></div></section>
+          <section class="card"><h2>部门管理</h2><form id="departmentForm" class="admin-form"><input name="name" placeholder="部门名称" required /><input name="parent_department_id" placeholder="上级部门 ID，可空" /><button class="secondary">新增部门</button></form><p id="departmentMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>ID</th><th>部门</th><th>上级</th><th>状态</th><th>操作</th></tr></thead><tbody id="departmentList"></tbody></table></div></section>
+          <section class="card"><h2>小组管理</h2><form id="groupForm" class="admin-form"><input name="name" placeholder="小组名称" required /><select name="department_id" id="groupDepartment" required></select><button class="secondary">新增小组</button></form><p id="groupMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>ID</th><th>部门</th><th>小组</th><th>状态</th><th>操作</th></tr></thead><tbody id="groupList"></tbody></table></div></section>
+          <section class="card"><h2>参数配置</h2><form id="settingsForm" class="settings-form"></form><p id="settingsMessage" class="message"></p></section>
+          <section class="card"><h2>运维工具</h2><div class="system-actions"><button class="secondary" id="testLlm">测试大模型连接</button><button class="secondary" id="cleanupSessions">清理过期会话</button><button class="secondary" id="storageStats">查看存储占用</button><button class="secondary" id="backupStorage">生成备份</button></div><p id="systemMessage" class="message"></p></section>
+          <section class="card danger-zone"><h2>清除业务数据</h2><p>清除日报、附件、测试总表、查重任务、导出文件、应用日志和当前会话。账号、部门、小组和系统参数会保留。</p><button class="danger-button" id="resetBusinessData">清除全部业务数据</button><p id="resetMessage" class="message"></p></section>
+        </div>
+      </section>
+    </main>
+  </div>
+<script src="/app.js?v=20260731-navfix"></script>
+</body>
+</html>

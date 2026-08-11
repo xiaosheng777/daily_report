@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import csv
 import json
+import re
+import subprocess
+import tempfile
+import zipfile
 from datetime import timedelta
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from docx import Document
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -34,11 +40,12 @@ class DailyReportPipeline:
         self.llm_judge = llm_judge
         self.daily_cfg = config.get("daily_duplicate", {})
         self.checks = config.get("checks", {})
+        self._code_token_cache: dict[str, tuple[list[str], int]] = {}
 
     def run(self, user: User | None = None, scope: dict[str, Any] | None = None, task_id: str = "", result_dir: str = "") -> dict[str, Any]:
         scope = scope or {}
         # Candidate data must stay inside the initiator's organisation scope.
-        reports_all = self.db.list_reports(user) if user else self.db.list_reports(None)
+        reports_all = self.db.list_reports(None) if not user or user.role == "admin" else self.db.list_reports(user)
         current_reports = self._filter_current_reports(reports_all, user, scope)
         cases = self._build_cases(current_reports, reports_all)
         missing_reports = self._find_missing_reports(current_reports, user, scope)
@@ -84,8 +91,6 @@ class DailyReportPipeline:
                 continue
             if user and user.role == "director" and r.department_id != user.department_id:
                 continue
-            if user and user.role == "admin":
-                continue
             if start and r.report_date < parse_date(start):
                 continue
             if end and r.report_date > parse_date(end):
@@ -124,7 +129,7 @@ class DailyReportPipeline:
                 if created_date and created_date > report_date:
                     continue
                 if (submitter["user_id"], report_date) not in submitted:
-                    missing.append({"report_date": report_date, "user_id": submitter["user_id"], "employee_name": submitter["display_name"], "role": submitter["role"], "department_name": submitter.get("department_name", ""), "group_name": submitter.get("group_name", "")})
+                    missing.append({"report_date": report_date, "user_id": submitter["user_id"], "employee_name": submitter["display_name"], "role": submitter["role"], "department_id": submitter.get("department_id", ""), "department_name": submitter.get("department_name", ""), "group_id": submitter.get("group_id", ""), "group_name": submitter.get("group_name", "")})
         return missing
 
     def _build_cases(self, current_reports: list[Report], all_reports: list[Report]) -> list[ReviewCase]:
@@ -146,16 +151,18 @@ class DailyReportPipeline:
                 self._testcase_check(report, all_reports, group_extras_cache),
             ]
             if self.checks.get("enable_code_check", True):
-                code = self._simple_artifact_check(report, "code")
+                code = self._code_token_check(report)
                 if code.triggered:
                     checks.append(code)
             if self.checks.get("enable_document_check", True):
-                doc = self._simple_artifact_check(report, "document")
+                doc = self._document_token_check(report)
                 if doc.triggered:
                     checks.append(doc)
             triggered = [c.checker_id for c in checks if c.triggered]
             risk = highest_risk(c.risk_level for c in checks if c.triggered) if triggered else "normal"
-            cases.append(ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id, report.department_name, report.report_date, report.title_summary, risk, triggered, checks))
+            cases.append(ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
+                                    report.department_name, report.group_id, report.group_name, report.report_date,
+                                    report.created_at, report.title_summary, risk, triggered, checks))
         return cases
 
     def _quality_check(self, report: Report) -> CheckResult:
@@ -500,6 +507,455 @@ class DailyReportPipeline:
             summary = "已记录文档附件，文档查重保持本人历史范围"
         return CheckResult(checker, True, "success", "normal", summary, [Finding(checker, "normal", "recorded", report.title_summary, score=0, reason=summary, details=details)])
 
+    def _code_token_check(self, report: Report) -> CheckResult:
+        checker = "code_check"
+        artifacts = self._code_artifacts(report)
+        items_present = any(any(str(value or "").strip() for value in item.values()) for item in report.code_items)
+        if not artifacts and not items_present:
+            return CheckResult(checker, False, "skipped", "normal", "未填写专项条目")
+        current_tokens, current_files = self._code_tokens(report)
+        if not current_tokens:
+            summary = "代码 Token 查重未执行：附件中未找到可解析的源代码文件"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "no_source_files", report.title_summary, reason=summary)])
+        history_days = int(self.checks.get("code_history_days", 30))
+        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history_with_tokens = [(candidate, *self._code_tokens(candidate)) for candidate in history]
+        history_with_tokens = [(candidate, tokens, file_count) for candidate, tokens, file_count in history_with_tokens if tokens]
+        if not history_with_tokens:
+            summary = f"未找到近 {history_days} 天可比对的本人历史代码"
+            return CheckResult(checker, True, "success", "normal", summary, [Finding(checker, "normal", "no_history", report.title_summary, reason=summary)])
+        matches = []
+        for candidate, history_tokens, history_files in history_with_tokens:
+            similarity, details = self._code_token_similarity(current_tokens, history_tokens)
+            matches.append({"source_name": "当前代码附件：" + "、".join(str(artifact.get("original_filename") or "未命名文件") for artifact in artifacts), "matched_name": f"{candidate.report_date} · {candidate.title_summary}", "similarity": similarity, "history_source_file_count": history_files, **details})
+        matches.sort(key=lambda item: item["similarity"], reverse=True)
+        similarity = matches[0]["similarity"]
+        medium = float(self.checks.get("code_token_similarity_threshold", 0.65))
+        high = float(self.checks.get("code_token_high_risk_threshold", 0.85))
+        if not 0 <= medium <= high <= 1:
+            raise ValueError("代码 Token 查重阈值需满足 0 ≤ 中风险 ≤ 高风险 ≤ 1")
+        risk = "high" if similarity >= high else "medium" if similarity >= medium else "normal"
+        summary = f"代码 Token 查重完成，最高相似度 {similarity:.1%}（本人近 {history_days} 天历史代码）"
+        finding = Finding(checker, risk, "code_token_similarity", report.title_summary, matches[0]["matched_name"], similarity, summary, {"current_source_file_count": current_files, "history_source_file_count": sum(file_count for _, _, file_count in history_with_tokens), "scope": "self_history_only", "engine": "code_token_similarity", "tokenizer": "normalized_code_5gram", "matches": matches})
+        return CheckResult(checker, True, "success", risk, summary, [finding])
+
+    def _code_tokens(self, report: Report) -> tuple[list[str], int]:
+        cached = self._code_token_cache.get(report.report_id)
+        if cached is not None:
+            return cached
+        allowed = {str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in self.config.get("upload", {}).get("allowed_code_ext", [".zip", ".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs", ".go", ".rs", ".php", ".rb", ".html", ".css"])}
+        source_extensions = allowed - {".zip"}
+        texts: list[str] = []
+        for artifact in self._code_artifacts(report):
+            name = Path(str(artifact.get("original_filename") or "source")).name
+            data = self.storage.read(str(artifact.get("stored_path") or ""))
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(BytesIO(data)) as archive:
+                    for member in archive.infolist():
+                        relative = Path(member.filename)
+                        if member.is_dir() or relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in source_extensions:
+                            continue
+                        texts.append(archive.read(member).decode("utf-8", errors="replace"))
+            elif Path(name).suffix.lower() in source_extensions:
+                texts.append(data.decode("utf-8", errors="replace"))
+        tokens = self._normalize_code_tokens("\n".join(texts))
+        result = (tokens, len(texts))
+        self._code_token_cache[report.report_id] = result
+        return result
+
+    @staticmethod
+    def _normalize_code_tokens(source: str) -> list[str]:
+        without_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`', " STR ", source)
+        without_comments = re.sub(r"/\*[\s\S]*?\*/|//[^\n]*|#[^\n]*", " ", without_strings)
+        raw_tokens = re.findall(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|==|!=|<=|>=|=>|\+\+|--|&&|\|\||\S", without_comments)
+        keywords = {"and", "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "def", "default", "do", "else", "enum", "except", "export", "extends", "finally", "for", "from", "function", "if", "import", "in", "interface", "let", "new", "not", "null", "package", "private", "protected", "public", "return", "static", "struct", "switch", "this", "throw", "try", "true", "false", "undefined", "var", "void", "while", "with", "yield"}
+        normalized = []
+        for token in raw_tokens:
+            lowered = token.lower()
+            if token == "STR": normalized.append("STR")
+            elif re.fullmatch(r"\d+(?:\.\d+)?", token): normalized.append("NUM")
+            elif re.fullmatch(r"[A-Za-z_]\w*", token): normalized.append(lowered if lowered in keywords else "ID")
+            else: normalized.append(token)
+        return normalized
+
+    @staticmethod
+    def _code_token_similarity(current_tokens: list[str], history_tokens: list[str]) -> tuple[float, dict[str, float | int]]:
+        def fingerprints(tokens: list[str]) -> set[tuple[str, ...]]:
+            return {tuple(tokens[index:index + 5]) for index in range(max(1, len(tokens) - 4))}
+        current_fingerprints, history_fingerprints = fingerprints(current_tokens), fingerprints(history_tokens)
+        overlap = len(current_fingerprints & history_fingerprints) / len(current_fingerprints | history_fingerprints) if current_fingerprints or history_fingerprints else 0.0
+        sequence = SequenceMatcher(None, current_tokens, history_tokens, autojunk=False).ratio()
+        return 0.7 * overlap + 0.3 * sequence, {"current_token_count": len(current_tokens), "matched_token_count": len(current_fingerprints & history_fingerprints), "token_overlap": overlap, "sequence_similarity": sequence}
+
+    def _batch_code_jplag_checks(self, current_reports: list[Report], all_reports: list[Report]) -> dict[str, CheckResult]:
+        """Run JPlag once per owner when a task contains several code submissions."""
+        jplag = self.config.get("jplag", {})
+        jar_path = Path(str(jplag.get("jar_path", "")))
+        if not jplag.get("enabled", True) or not jar_path.is_file():
+            return {}
+        reports_with_code = [report for report in current_reports if self._code_artifacts(report)]
+        grouped: dict[str, list[Report]] = {}
+        for report in reports_with_code:
+            grouped.setdefault(report.owner_user_id, []).append(report)
+        results: dict[str, CheckResult] = {}
+        history_days = int(self.checks.get("code_history_days", 30))
+        for owner_id, targets in grouped.items():
+            if len(targets) < 2:
+                continue
+            earliest = min(report.report_date for report in targets)
+            latest = max(report.report_date for report in targets)
+            target_ids = {report.report_id for report in targets}
+            candidates = [
+                report for report in all_reports
+                if report.owner_user_id == owner_id and self._code_artifacts(report)
+                and (report.report_id in target_ids or (report.report_date <= latest and days_between(report.report_date, earliest) <= history_days))
+            ]
+            try:
+                results.update(self._run_batched_code_jplag(jar_path, targets, candidates, history_days))
+            except (OSError, subprocess.SubprocessError, ValueError, zipfile.BadZipFile) as exc:
+                for report in targets:
+                    summary = f"代码 JPlag 批量查重执行失败：{exc}"
+                    results[report.report_id] = CheckResult("code_check", True, "unknown", "unknown", summary, [Finding("code_check", "unknown", "execution_failed", report.title_summary, reason=summary)])
+        return results
+
+    def _run_batched_code_jplag(self, jar_path: Path, targets: list[Report], candidates: list[Report], history_days: int) -> dict[str, CheckResult]:
+        jplag = self.config.get("jplag", {})
+        medium = float(jplag.get("code_similarity_threshold", 0.65))
+        high = float(jplag.get("code_high_risk_threshold", 0.85))
+        if not 0 <= medium <= high <= 1:
+            raise ValueError("JPlag 代码阈值需满足 0 ≤ 中风险 ≤ 高风险 ≤ 1")
+        with tempfile.TemporaryDirectory(prefix="daily-report-jplag-") as work:
+            root = Path(work)
+            new_root, old_root = root / "new", root / "old"
+            report_by_submission: dict[str, Report] = {}
+            source_files: dict[str, int] = {}
+            target_ids = {report.report_id for report in targets}
+            for index, report in enumerate(candidates):
+                submission_name = f"submission_{index:03d}"
+                file_count = self._write_code_submission(old_root / submission_name, self._code_artifacts(report))
+                if file_count:
+                    report_by_submission[submission_name] = report
+                    source_files[report.report_id] = file_count
+                    if report.report_id in target_ids:
+                        self._write_code_submission(new_root / submission_name, self._code_artifacts(report))
+            if not target_ids.issubset(source_files):
+                return {}
+            _, raw_matches = self._run_jplag_result(jar_path, root, new_root, old_root, str(jplag.get("code_language", "multi")), int(jplag.get("code_min_tokens", 12)), int(jplag.get("code_timeout_seconds", 120)), ["multi", "--languages", str(jplag.get("code_multi_languages", "c,cpp,csharp,go,java,javascript,kotlin,python3,rust,typescript"))] if str(jplag.get("code_language", "multi")) == "multi" else [])
+
+        match_rows: dict[str, list[dict[str, Any]]] = {report_id: [] for report_id in target_ids}
+        for match in raw_matches:
+            left_name, right_name = str(match.get("source") or ""), str(match.get("matched") or "")
+            left_report = next((report for name, report in report_by_submission.items() if name in left_name), None)
+            right_report = next((report for name, report in report_by_submission.items() if name in right_name), None)
+            if not left_report or not right_report or left_report.report_id == right_report.report_id:
+                continue
+            for current, historical in ((left_report, right_report), (right_report, left_report)):
+                if current.report_id not in target_ids or historical.report_date > current.report_date or days_between(historical.report_date, current.report_date) > history_days:
+                    continue
+                match_rows[current.report_id].append({
+                    "source_name": "当前代码附件：" + "、".join(str(artifact.get("original_filename") or "未命名文件") for artifact in self._code_artifacts(current)),
+                    "matched_name": f"{historical.report_date} · {historical.title_summary}",
+                    "similarity": float(match.get("similarity") or 0),
+                })
+
+        results = {}
+        for report in targets:
+            valid_history = [candidate for candidate in candidates if candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+            if not valid_history:
+                summary = f"未找到近 {history_days} 天可比对的本人历史代码"
+                results[report.report_id] = CheckResult("code_check", True, "success", "normal", summary, [Finding("code_check", "normal", "no_history", report.title_summary, reason=summary)])
+                continue
+            matches = sorted(match_rows[report.report_id], key=lambda item: item["similarity"], reverse=True)
+            similarity = matches[0]["similarity"] if matches else 0.0
+            risk = "high" if similarity >= high else "medium" if similarity >= medium else "normal"
+            history_files = sum(source_files.get(candidate.report_id, 0) for candidate in valid_history)
+            summary = f"JPlag 代码批量查重完成，最高相似度 {similarity:.1%}（本人近 {history_days} 天历史代码）"
+            finding = Finding("code_check", risk, "jplag_code", report.title_summary, matches[0]["matched_name"] if matches else "本人历史代码", similarity, summary, {
+                "language": str(jplag.get("code_language", "multi")), "current_source_file_count": source_files[report.report_id],
+                "history_source_file_count": history_files, "scope": "self_history_only", "engine": "jplag", "execution": "batched",
+                "matches": matches,
+            })
+            results[report.report_id] = CheckResult("code_check", True, "success", risk, summary, [finding])
+        return results
+
+    def _code_jplag_check(self, report: Report) -> CheckResult:
+        checker = "code_check"
+        artifacts = self._code_artifacts(report)
+        items_present = any(any(str(value or "").strip() for value in item.values()) for item in report.code_items)
+        if not artifacts and not items_present:
+            return CheckResult(checker, False, "skipped", "normal", "未填写专项条目")
+        if not artifacts:
+            return CheckResult(checker, True, "success", "normal", "已记录代码条目；未上传可供 JPlag 查重的代码附件")
+
+        jplag = self.config.get("jplag", {})
+        jar_path = Path(str(jplag.get("jar_path", "")))
+        if not jplag.get("enabled", True) or not jar_path.is_file():
+            summary = "代码 JPlag 查重未执行：JPlag jar 不可用"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "unavailable", report.title_summary, reason=summary)])
+
+        history_days = int(self.checks.get("code_history_days", 30))
+        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history_with_code = [(candidate, self._code_artifacts(candidate)) for candidate in history]
+        history_with_code = [(candidate, submission) for candidate, submission in history_with_code if submission]
+        if not history_with_code:
+            summary = f"未找到近 {history_days} 天可比对的本人历史代码"
+            return CheckResult(checker, True, "success", "normal", summary, [Finding(checker, "normal", "no_history", report.title_summary, reason=summary)])
+
+        try:
+            jplag_result = self._run_code_jplag(jar_path, artifacts, [submission for _, submission in history_with_code], True)
+            similarity, current_files, history_files = jplag_result[:3]
+            raw_matches = jplag_result[3] if len(jplag_result) > 3 else []
+        except (OSError, subprocess.SubprocessError, ValueError, zipfile.BadZipFile) as exc:
+            summary = f"代码 JPlag 查重执行失败：{exc}"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "execution_failed", report.title_summary, reason=summary)])
+        if not current_files or not history_files:
+            summary = "代码 JPlag 查重未执行：附件中未找到受支持的源代码文件"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "no_source_files", report.title_summary, reason=summary)])
+
+        medium = float(jplag.get("code_similarity_threshold", 0.65))
+        high = float(jplag.get("code_high_risk_threshold", 0.85))
+        if not 0 <= medium <= high <= 1:
+            raise ValueError("JPlag 代码阈值需满足 0 ≤ 中风险 ≤ 高风险 ≤ 1")
+        risk = "high" if similarity >= high else "medium" if similarity >= medium else "normal"
+        summary = f"JPlag 代码查重完成，最高相似度 {similarity:.1%}（本人近 {history_days} 天历史代码）"
+        finding = Finding(checker, risk, "jplag_code", report.title_summary, "本人历史代码", similarity, summary, {
+            "language": str(jplag.get("code_language", "multi")), "current_source_file_count": current_files,
+            "history_source_file_count": history_files, "scope": "self_history_only", "engine": "jplag",
+            "matches": self._format_jplag_matches(
+                raw_matches,
+                "当前代码附件：" + "、".join(str(a.get("original_filename") or "未命名文件") for a in artifacts),
+                [f"{candidate.report_date} · {candidate.title_summary}" for candidate, _ in history_with_code],
+            ),
+        })
+        return CheckResult(checker, True, "success", risk, summary, [finding])
+
+    def _code_artifacts(self, report: Report) -> list[dict[str, Any]]:
+        return [artifact for artifact in self.db.list_artifacts_for_report(report.report_id) if artifact.get("artifact_type") == "code"]
+
+    def _document_token_check(self, report: Report) -> CheckResult:
+        checker = "document_check"
+        artifacts = self._document_artifacts(report)
+        items_present = any(any(str(value or "").strip() for value in item.values()) for item in report.document_items)
+        if not artifacts and not items_present:
+            return CheckResult(checker, False, "skipped", "normal", "未填写专项条目")
+        if not artifacts:
+            return CheckResult(checker, True, "success", "normal", "已记录文档条目；未上传可供正文 Token 查重的文档附件")
+
+        history_days = int(self.checks.get("document_history_days", 30))
+        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        historical_artifacts = [(candidate, artifact) for candidate in history for artifact in self._document_artifacts(candidate)]
+        if not historical_artifacts:
+            summary = f"未找到近 {history_days} 天可比对的本人历史文档"
+            return CheckResult(checker, True, "success", "normal", summary, [Finding(checker, "normal", "no_history", report.title_summary, reason=summary)])
+
+        try:
+            current_documents = [(artifact, self._extract_document_text(artifact)) for artifact in artifacts]
+            history_documents = [(history_report, artifact, self._extract_document_text(artifact)) for history_report, artifact in historical_artifacts]
+        except ValueError as exc:
+            summary = f"文档 Token 查重未执行：{exc}"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "extract_failed", report.title_summary, reason=summary)])
+        current_documents = [(artifact, text) for artifact, text in current_documents if text.strip()]
+        history_documents = [(history_report, artifact, text) for history_report, artifact, text in history_documents if text.strip()]
+        if not current_documents or not history_documents:
+            summary = "文档 Token 查重未执行：没有可提取的正文（支持 docx、pdf、txt、md、xlsx）"
+            return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "no_extractable_text", report.title_summary, reason=summary)])
+
+        matches = []
+        for current_artifact, current_text in current_documents:
+            for history_report, history_artifact, history_text in history_documents:
+                similarity, token_details = self._document_token_similarity(current_text, history_text)
+                matches.append({
+                    "source_name": str(current_artifact.get("original_filename") or "未命名文件"),
+                    "matched_name": f"{history_report.report_date} · {history_report.title_summary} · {history_artifact.get('original_filename') or '未命名文件'}",
+                    "similarity": similarity,
+                    **token_details,
+                })
+        matches.sort(key=lambda item: item["similarity"], reverse=True)
+        similarity = matches[0]["similarity"]
+        medium = float(self.checks.get("document_token_similarity_threshold", 0.65))
+        high = float(self.checks.get("document_token_high_risk_threshold", 0.85))
+        if not 0 <= medium <= high <= 1:
+            raise ValueError("文档 Token 查重阈值需满足 0 ≤ 中风险 ≤ 高风险 ≤ 1")
+        risk = "high" if similarity >= high else "medium" if similarity >= medium else "normal"
+        summary = f"文档 Token 查重完成，最高相似度 {similarity:.1%}（本人近 {history_days} 天历史文档）"
+        finding = Finding(checker, risk, "token_similarity", report.title_summary, matches[0]["matched_name"], similarity, summary, {
+            "current_document_count": len(current_documents), "history_document_count": len(history_documents),
+            "scope": "self_history_only", "engine": "token_similarity", "tokenizer": "han_character_and_word",
+            "matches": matches,
+        })
+        return CheckResult(checker, True, "success", risk, summary, [finding])
+
+    def _document_artifacts(self, report: Report) -> list[dict[str, Any]]:
+        return [artifact for artifact in self.db.list_artifacts_for_report(report.report_id) if artifact.get("artifact_type") == "document"]
+
+    def _extract_document_texts(self, artifacts: list[dict[str, Any]]) -> list[str]:
+        texts = []
+        for artifact in artifacts:
+            text = self._extract_document_text(artifact)
+            if text.strip():
+                texts.append(text)
+        return texts
+
+    def _extract_document_text(self, artifact: dict[str, Any]) -> str:
+        name = str(artifact.get("original_filename") or "").lower()
+        data = self.storage.read(str(artifact.get("stored_path") or ""))
+        if name.endswith(".docx"):
+            document = Document(BytesIO(data))
+            parts = [paragraph.text for paragraph in document.paragraphs]
+            parts.extend(cell.text for table in document.tables for row in table.rows for cell in row.cells)
+            return "\n".join(parts)
+        if name.endswith(".pdf"):
+            try:
+                from pypdf import PdfReader
+            except ImportError as exc:
+                raise ValueError("缺少 pypdf 依赖，无法读取 PDF") from exc
+            return "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
+        if name.endswith((".txt", ".md")):
+            return data.decode("utf-8", errors="replace")
+        if name.endswith(".xlsx"):
+            workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+            return "\n".join(str(cell) for sheet in workbook.worksheets for row in sheet.iter_rows(values_only=True) for cell in row if cell not in (None, ""))
+        return ""
+
+    @staticmethod
+    def _document_token_similarity(current_text: str, history_text: str) -> tuple[float, dict[str, float | int]]:
+        current_tokens = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[a-zA-Z0-9_]+", normalize_text(current_text))
+        history_tokens = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[a-zA-Z0-9_]+", normalize_text(history_text))
+        if not current_tokens or not history_tokens:
+            return 0.0, {"current_token_count": len(current_tokens), "matched_token_count": 0, "token_overlap": 0.0, "sequence_similarity": 0.0}
+        current_set, history_set = set(current_tokens), set(history_tokens)
+        overlap = len(current_set & history_set) / len(current_set | history_set)
+        sequence = SequenceMatcher(None, current_tokens, history_tokens, autojunk=False).ratio()
+        score = 0.55 * overlap + 0.45 * sequence
+        return score, {
+            "current_token_count": len(current_tokens),
+            "matched_token_count": len(current_set & history_set),
+            "token_overlap": overlap,
+            "sequence_similarity": sequence,
+        }
+
+    def _run_code_jplag(self, jar_path: Path, current_artifacts: list[dict[str, Any]], history_submissions: list[list[dict[str, Any]]], include_matches: bool = False) -> tuple[float, int, int] | tuple[float, int, int, list[dict[str, Any]]]:
+        jplag = self.config.get("jplag", {})
+        with tempfile.TemporaryDirectory(prefix="daily-report-jplag-") as work:
+            root = Path(work)
+            new_root, old_root = root / "new", root / "old"
+            current_files = self._write_code_submission(new_root / "current", current_artifacts)
+            history_files = sum(self._write_code_submission(old_root / f"history_{index:03d}", artifacts) for index, artifacts in enumerate(history_submissions))
+            if not current_files or not history_files:
+                return 0.0, current_files, history_files
+            language = str(jplag.get("code_language", "multi"))
+            multi_languages = str(jplag.get("code_multi_languages", "c,cpp,csharp,go,java,javascript,kotlin,python3,rust,typescript"))
+            language_options = ["multi", "--languages", multi_languages] if language == "multi" else []
+            similarity, matches = self._run_jplag_result(jar_path, root, new_root, old_root, language, int(jplag.get("code_min_tokens", 12)), int(jplag.get("code_timeout_seconds", 120)), language_options)
+            return (similarity, current_files, history_files, matches) if include_matches else (similarity, current_files, history_files)
+
+    def _run_jplag(self, jar_path: Path, root: Path, new_root: Path, old_root: Path, language: str, min_tokens: int, timeout: int, language_options: list[str] | None = None) -> float:
+        return self._run_jplag_result(jar_path, root, new_root, old_root, language, min_tokens, timeout, language_options)[0]
+
+    def _run_jplag_result(self, jar_path: Path, root: Path, new_root: Path, old_root: Path, language: str, min_tokens: int, timeout: int, language_options: list[str] | None = None) -> tuple[float, list[dict[str, Any]]]:
+        jplag = self.config.get("jplag", {})
+        result_file = root / "result"
+        # JPlag's default AUTO mode may select RUN_AND_VIEW and open its report viewer.
+        # RUN keeps it headless: it only writes result files for this application to parse.
+        command = [str(jplag.get("java_command", "java")), "-jar", str(jar_path), "--mode", "RUN", "--language", language, "--min-tokens", str(min_tokens), "--csv-export", "--overwrite", "--result-file", str(result_file), "--new", str(new_root), "--old", str(old_root), *(language_options or [])]
+        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=timeout, check=False)
+        if completed.returncode:
+            message = (completed.stderr or completed.stdout or "JPlag returned a non-zero exit code").strip()
+            raise ValueError(message if len(message) <= 1000 else f"{message[:500]}\n…\n{message[-500:]}")
+        similarity, matches = self._read_jplag_result(root)
+        if similarity is None:
+            raise ValueError("JPlag 未生成可解析的相似度结果")
+        return similarity, matches
+
+    def _write_code_submission(self, submission: Path, artifacts: list[dict[str, Any]]) -> int:
+        allowed = {str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in self.config.get("upload", {}).get("allowed_code_ext", [".zip", ".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs", ".go", ".rs", ".php", ".rb", ".html", ".css"])}
+        jplag_source_extensions = {".c", ".cpp", ".cc", ".cxx", ".cs", ".go", ".java", ".js", ".kt", ".kts", ".py", ".rs", ".scala", ".scm", ".ss", ".ts", ".tsx"}
+        source_extensions = allowed.intersection(jplag_source_extensions)
+        count = 0
+        for index, artifact in enumerate(artifacts):
+            name = Path(str(artifact.get("original_filename") or "source")).name
+            data = self.storage.read(str(artifact.get("stored_path") or ""))
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(BytesIO(data)) as archive:
+                    for member in archive.infolist():
+                        relative = Path(member.filename)
+                        if member.is_dir() or relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in source_extensions:
+                            continue
+                        target = submission / f"archive_{index:03d}" / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(archive.read(member))
+                        count += 1
+            elif Path(name).suffix.lower() in source_extensions:
+                submission.mkdir(parents=True, exist_ok=True)
+                (submission / f"file_{index:03d}_{name}").write_bytes(data)
+                count += 1
+        return count
+
+    @staticmethod
+    def _read_jplag_similarity(root: Path) -> float | None:
+        return DailyReportPipeline._read_jplag_result(root)[0]
+
+    @staticmethod
+    def _read_jplag_result(root: Path) -> tuple[float | None, list[dict[str, Any]]]:
+        scores = []
+        matches = []
+        for path in root.rglob("*.csv"):
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    similarity_values = []
+                    for key, value in row.items():
+                        if "similarity" not in str(key).lower() or value in (None, ""):
+                            continue
+                        try:
+                            score = float(str(value).strip().rstrip("%"))
+                        except ValueError:
+                            continue
+                        normalized = score / 100 if str(value).strip().endswith("%") or score > 1 else score
+                        scores.append(normalized)
+                        similarity_values.append(normalized)
+                    submission_names = [str(value).strip() for key, value in row.items() if value not in (None, "") and "submission" in str(key).lower()]
+                    normalized_names = [name.replace("\\", "/").lower() for name in submission_names]
+                    if len(submission_names) >= 2 and similarity_values and any("new/" in name or "old/" in name for name in normalized_names[:2]):
+                        matches.append({"source": submission_names[0], "matched": submission_names[1], "similarity": max(similarity_values)})
+        if scores:
+            return max(0.0, min(1.0, max(scores))), matches
+        for path in root.rglob("*.zip"):
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if not name.endswith(".json"):
+                        continue
+                    data = json.loads(archive.read(name).decode("utf-8"))
+                    DailyReportPipeline._collect_similarity_values(data, scores)
+        return (max(0.0, min(1.0, max(scores))), matches) if scores else (None, [])
+
+    @staticmethod
+    def _format_jplag_matches(matches: list[dict[str, Any]], current_label: str, history_labels: list[str]) -> list[dict[str, Any]]:
+        formatted = []
+        for match in matches:
+            source, matched = str(match.get("source") or ""), str(match.get("matched") or "")
+            source_is_current = "/new/" in source.replace("\\", "/") or "new_" in source
+            matched_is_current = "/new/" in matched.replace("\\", "/") or "new_" in matched
+            if matched_is_current and not source_is_current:
+                source, matched = matched, source
+            history_index = next((index for index in range(len(history_labels)) if f"history_{index:03d}" in matched or f"old_{index:03d}" in matched), None)
+            formatted.append({
+                "source_name": current_label if source_is_current or matched_is_current else source,
+                "matched_name": history_labels[history_index] if history_index is not None else matched,
+                "similarity": max(0.0, min(1.0, float(match.get("similarity") or 0))),
+            })
+        return sorted(formatted, key=lambda item: item["similarity"], reverse=True)
+
+    @staticmethod
+    def _collect_similarity_values(value: Any, scores: list[float], key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                DailyReportPipeline._collect_similarity_values(child, scores, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                DailyReportPipeline._collect_similarity_values(child, scores, key)
+        elif "similarity" in key.lower() and isinstance(value, (int, float)):
+            scores.append(float(value) / 100 if float(value) > 1 else float(value))
+
     @staticmethod
     def build_report_id(report: Report) -> str:
         return "R_" + stable_hash(f"{report.owner_user_id}|{report.report_date}|{report.title_summary}|{report.work_description}")[:16]
@@ -509,10 +965,10 @@ class DailyReportPipeline:
         wb = Workbook()
         ws = wb.active
         ws.title = "review_cases"
-        ws.append(["日期", "员工", "部门", "标题", "总体风险", "触发检查", "摘要"])
+        ws.append(["查重归属日期", "提交时间", "员工", "部门", "标题", "总体风险", "触发检查", "摘要"])
         for c in cases:
             summary = "；".join(check.get("summary", "") for check in c.get("checks", []) if check.get("triggered"))
-            ws.append([c.get("report_date"), c.get("employee_name"), c.get("department_name"), c.get("title_summary"), c.get("overall_risk"), ",".join(c.get("triggered_checks", [])), summary])
+            ws.append([c.get("report_date"), c.get("submitted_at"), c.get("employee_name"), c.get("department_name"), c.get("title_summary"), c.get("overall_risk"), ",".join(c.get("triggered_checks", [])), summary])
         path.parent.mkdir(parents=True, exist_ok=True)
         wb.save(path)
 
@@ -523,6 +979,7 @@ class DailyReportPipeline:
         doc.add_paragraph(f"共 {len(cases)} 份日报")
         for c in cases:
             doc.add_heading(f"{c.get('report_date')} · {c.get('employee_name')} · {c.get('overall_risk')}", level=2)
+            doc.add_paragraph(f"查重归属日期：{c.get('report_date') or ''}；提交时间：{c.get('submitted_at') or ''}")
             doc.add_paragraph(str(c.get("title_summary") or ""))
             for check in c.get("checks", []):
                 if check.get("triggered"):

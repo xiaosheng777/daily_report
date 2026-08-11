@@ -9,7 +9,7 @@ from docx import Document
 from src.core.schemas import Report
 from src.utils.dates import parse_date
 
-FIELD_NAMES = ("姓名", "部门", "日期", "直属负责人", "标题总结", "工作描述")
+FIELD_NAMES = ("姓名", "部门", "日期", "查重归属日期", "提交时间", "直属负责人", "标题总结", "工作描述")
 
 
 def build_report_docx(payload: dict[str, Any]) -> bytes:
@@ -18,7 +18,8 @@ def build_report_docx(payload: dict[str, Any]) -> bytes:
         "员工日报", "", "一、基础信息",
         f"姓名：{payload.get('name') or payload.get('employee_name') or ''}",
         f"部门：{payload.get('department') or payload.get('department_name') or ''}",
-        f"日期：{payload.get('date') or payload.get('report_date') or ''}",
+        f"查重归属日期：{payload.get('report_date') or payload.get('date') or ''}",
+        f"提交时间：{payload.get('submitted_at') or payload.get('created_at') or ''}",
         f"直属负责人：{payload.get('manager') or ''}",
         "", "二、今日完成工作",
         f"标题总结：{payload.get('title_summary') or ''}",
@@ -69,12 +70,15 @@ def parse_report_docx(file_path: str | Path, owner_user_id: str = "", department
     document = Document(str(path))
     lines = [p.text.strip() for p in document.paragraphs if p.text.strip()]
     fields = _extract_fields(lines)
-    missing = [name for name in FIELD_NAMES if not fields.get(name)]
+    required = ("姓名", "部门", "直属负责人", "标题总结", "工作描述")
+    missing = [name for name in required if not fields.get(name)]
+    if not (fields.get("查重归属日期") or fields.get("日期")):
+        missing.append("查重归属日期")
     if missing:
         raise ValueError(f"缺少字段: {', '.join(missing)}")
     return Report(
         report_id="", owner_user_id=owner_user_id, employee_name=fields["姓名"], department_id=department_id,
-        department_name=fields["部门"], report_date=parse_date(fields["日期"]), manager=fields["直属负责人"],
+        department_name=fields["部门"], report_date=parse_date(fields.get("查重归属日期") or fields["日期"]), manager=fields["直属负责人"],
         title_summary=fields["标题总结"], work_description=fields["工作描述"], source_type="file", original_filename=path.name,
     )
 

@@ -1,4 +1,6 @@
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -42,6 +44,20 @@ def save_report(db: SQLiteBackend, owner, report_id: str) -> None:
                           "今日工作", "完成今日工作内容", created_at=now_iso(),
                           group_id=owner.group_id, group_name=owner.group_name,
                           submitter_role=owner.role))
+
+
+def test_session_expiry_uses_the_same_shanghai_clock(tmp_path, monkeypatch):
+    db = SQLiteBackend(tmp_path / "session.sqlite3")
+    db.initialize(False)
+    clock = datetime(2026, 8, 10, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("src.db.sqlite_backend.shanghai_now", lambda: clock)
+    monkeypatch.setattr("src.db.sqlite_backend.now_iso", lambda: "2026-08-10T20:00:00")
+
+    session_id = db.create_session("user-1")
+    with db.connect() as conn:
+        expires_at = conn.execute("select expires_at from sessions where session_id=?", (session_id,)).fetchone()[0]
+
+    assert expires_at == "2026-08-17T20:00:00"
 
 
 def test_leader_uniqueness_and_derived_manager_chain(tmp_path):
@@ -115,13 +131,26 @@ def test_organisation_delete_errors_explain_remaining_dependencies(tmp_path):
         db.delete_group("g1")
 
 
-def test_bootstrap_initialization_creates_only_admin(tmp_path):
+def test_bootstrap_initialization_creates_admin_and_test_employee(tmp_path):
     db = SQLiteBackend(tmp_path / "bootstrap.sqlite3")
     db.initialize(True)
 
-    assert [u["username"] for u in db.list_users()] == ["admin"]
+    users = {u["username"]: u for u in db.list_users()}
+    assert set(users) == {"admin", "test_employee"}
+    assert users["test_employee"]["role"] == "employee"
+    assert users["test_employee"]["is_test_account"] is True
     assert db.list_departments() == []
     assert db.list_groups() == []
+
+
+def test_reset_confirmation_uses_the_same_clock_for_creation_and_validation(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.db.sqlite_backend.now_iso", lambda: "2030-01-01T09:00:00")
+    db = SQLiteBackend(tmp_path / "reset.sqlite3")
+    db.initialize(False)
+
+    confirmation_id = db.create_reset_confirmation("u_admin")
+
+    assert db.consume_reset_confirmation(confirmation_id, "u_admin") is True
 
 
 def test_missing_reports_cover_workdays_and_submitter_scope(tmp_path):
@@ -137,7 +166,7 @@ def test_missing_reports_cover_workdays_and_submitter_scope(tmp_path):
     result = pipeline.run(leader, {"report_date_start": "2026-07-31", "report_date_end": "2026-08-02"}, "task", str(tmp_path / "task"))
 
     assert result["summary"]["missing_report_count"] == 1
-    assert result["missing_reports"] == [{"report_date": "2026-07-31", "user_id": leader.user_id, "employee_name": leader.display_name, "role": "group_leader", "department_name": "研发部", "group_name": "一组"}]
+    assert result["missing_reports"] == [{"report_date": "2026-07-31", "user_id": leader.user_id, "employee_name": leader.display_name, "role": "group_leader", "department_id": "d1", "department_name": "研发部", "group_id": "g1", "group_name": "一组"}]
     assert (tmp_path / "task" / "missing_reports.xlsx").exists()
     assert {u["username"] for u in db.list_required_submitters(leader)} == {"leader1", "employee1"}
     assert {u["username"] for u in db.list_required_submitters(as_user(db, "director"))} == {"leader1", "leader2", "employee1", "employee2"}

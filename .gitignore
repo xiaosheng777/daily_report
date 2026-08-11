@@ -17,10 +17,10 @@ env/
 !.env.example
 
 # Real configuration and secrets (keep *.example files tracked)
-config/config.yaml
-config/llm_api_key
-backend/config/config.yaml
-backend/config/llm_api_key
+# config/config.yaml
+# config/llm_api_key
+# backend/config/config.yaml
+# backend/config/llm_api_key
 
 # Runtime databases, logs, uploads, exports, and generated business data
 *.sqlite3

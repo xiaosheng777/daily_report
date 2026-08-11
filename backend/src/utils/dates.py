@@ -7,12 +7,17 @@ from zoneinfo import ZoneInfo
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
+def shanghai_now() -> datetime:
+    """Return the single authoritative clock for all business timestamps."""
+    return datetime.now(SHANGHAI_TIMEZONE)
+
+
 def today_iso() -> str:
-    return datetime.now(SHANGHAI_TIMEZONE).date().isoformat()
+    return shanghai_now().date().isoformat()
 
 
 def now_iso() -> str:
-    return datetime.now(SHANGHAI_TIMEZONE).replace(tzinfo=None).isoformat(timespec="seconds")
+    return shanghai_now().replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def parse_date(value: str) -> str:

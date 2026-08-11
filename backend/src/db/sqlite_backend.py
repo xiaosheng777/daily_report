@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from src.core.schemas import Report, User
 from src.db.base import DatabaseBackend
-from src.utils.dates import now_iso
+from src.utils.dates import now_iso, shanghai_now, today_iso
 from src.utils.security import hash_password, token, verify_password
 
 ROLE_EMPLOYEE = "employee"
@@ -21,7 +21,7 @@ BUSINESS_ROLES = MANAGER_ROLES | {ROLE_EMPLOYEE}
 
 
 def can_manage(user: User) -> bool:
-    return user.role in MANAGER_ROLES
+    return user.role in MANAGER_ROLES | {ROLE_ADMIN}
 
 
 def can_admin(user: User) -> bool:
@@ -61,6 +61,7 @@ class SQLiteBackend(DatabaseBackend):
               user_id text primary key, username text not null unique, password_hash text not null,
               display_name text not null, department_id text default '', group_id text default '',
               manager_user_id text default '', role text not null, enabled integer not null default 1,
+              is_test_account integer not null default 0,
               created_at text not null
             );
             create table if not exists sessions (
@@ -92,6 +93,7 @@ class SQLiteBackend(DatabaseBackend):
             create table if not exists check_tasks (
               task_id text primary key, created_by text not null, department_id text default '',
               task_name text default '', task_date text default '',
+              trigger_source text not null default 'manual', report_date text default '', attempt_count integer not null default 0,
               payload_json text not null, config_snapshot_json text default '{}', result_json text default '{}',
               result_dir text default '', status text not null, error_message text default '', created_at text not null,
               finished_at text default ''
@@ -109,6 +111,7 @@ class SQLiteBackend(DatabaseBackend):
             for stmt in [
                 "alter table users add column manager_user_id text default ''",
                 "alter table users add column group_id text default ''",
+                "alter table users add column is_test_account integer not null default 0",
                 "alter table reports add column stored_path text default ''",
                 "alter table reports add column file_size integer default 0",
                 "alter table reports add column content_hash text default ''",
@@ -123,6 +126,9 @@ class SQLiteBackend(DatabaseBackend):
                 "alter table check_tasks add column department_id text default ''",
                 "alter table check_tasks add column task_name text default ''",
                 "alter table check_tasks add column task_date text default ''",
+                "alter table check_tasks add column trigger_source text not null default 'manual'",
+                "alter table check_tasks add column report_date text default ''",
+                "alter table check_tasks add column attempt_count integer not null default 0",
                 "alter table check_tasks add column config_snapshot_json text default '{}'",
                 "alter table check_tasks add column result_dir text default ''",
                 "alter table testcase_snapshots add column group_id text default ''",
@@ -132,6 +138,7 @@ class SQLiteBackend(DatabaseBackend):
                     db.execute(stmt)
                 except sqlite3.OperationalError:
                     pass
+            db.execute("create unique index if not exists idx_check_tasks_system_daily on check_tasks(trigger_source, task_date) where trigger_source='system_daily'")
             self._migrate_testcase_snapshots_unique(db)
             db.execute("update users set role = ? where role = 'department_manager'", (ROLE_DIRECTOR,))
             db.execute("update users set role = ? where role = 'global_manager'", (ROLE_MINISTER,))
@@ -171,8 +178,10 @@ class SQLiteBackend(DatabaseBackend):
 
     def _seed_bootstrap_admin(self) -> None:
         with self.connect() as db:
-            db.execute("""insert or ignore into users(user_id,username,password_hash,display_name,department_id,group_id,manager_user_id,role,enabled,created_at)
-                values ('u_admin','admin',?,'Admin','','','',?,1,?)""", (hash_password("admin123"), ROLE_ADMIN, now_iso()))
+            db.execute("""insert or ignore into users(user_id,username,password_hash,display_name,department_id,group_id,manager_user_id,role,enabled,is_test_account,created_at)
+                values ('u_admin','admin',?,'Admin','','','',?,1,0,?)""", (hash_password("admin123"), ROLE_ADMIN, now_iso()))
+            db.execute("""insert or ignore into users(user_id,username,password_hash,display_name,department_id,group_id,manager_user_id,role,enabled,is_test_account,created_at)
+                values ('u_test_employee','test_employee',?,'测试员工','','','',?,1,1,?)""", (hash_password("test123"), ROLE_EMPLOYEE, now_iso()))
 
     # Authentication and organisation -------------------------------------------------
     def authenticate(self, username: str, password: str) -> User | None:
@@ -181,7 +190,8 @@ class SQLiteBackend(DatabaseBackend):
         return self._row_to_user(row) if row and row["enabled"] and verify_password(password, row["password_hash"]) else None
 
     def create_session(self, user_id: str, days: int = 7) -> str:
-        sid = token("S_", 28); exp = (datetime.utcnow() + timedelta(days=days)).isoformat(timespec="seconds")
+        sid = token("S_", 28)
+        exp = (shanghai_now() + timedelta(days=days)).replace(tzinfo=None).isoformat(timespec="seconds")
         with self.connect() as db: db.execute("insert into sessions(session_id,user_id,expires_at,created_at) values (?,?,?,?)", (sid, user_id, exp, now_iso()))
         return sid
 
@@ -274,11 +284,11 @@ class SQLiteBackend(DatabaseBackend):
             scope, values = "u.group_id=?", [user.group_id]
         elif user.role == ROLE_DIRECTOR:
             scope, values = "u.department_id=?", [user.department_id]
-        elif user.role == ROLE_MINISTER:
+        elif user.role in {ROLE_MINISTER, ROLE_ADMIN}:
             scope, values = "1=1", []
         else:
             return []
-        sql = self._user_select() + f" where {scope} and u.enabled=1 and u.role in (?,?) order by d.name,g.name,u.display_name"
+        sql = self._user_select() + f" where {scope} and u.enabled=1 and coalesce(u.is_test_account, 0)=0 and u.role in (?,?) order by d.name,g.name,u.display_name"
         with self.connect() as db:
             rows = db.execute(sql, [*values, ROLE_EMPLOYEE, ROLE_GROUP_LEADER]).fetchall()
         return [self._user_dict(self._row_to_user(r)) | {"created_at": r["created_at"]} for r in rows]
@@ -483,18 +493,44 @@ class SQLiteBackend(DatabaseBackend):
     # Tasks and maintenance ------------------------------------------------------------
     def create_task(self, user: User, payload: dict[str, Any], config_snapshot: dict[str, Any], result_dir: str) -> str:
         tid = token("T_", 14); dept = user.department_id if user.role in {ROLE_GROUP_LEADER, ROLE_DIRECTOR} else ""
-        task_date = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        task_date = today_iso()
         with self.connect() as db:
             sequence = db.execute("select count(*) from check_tasks where created_by=? and task_date=?", (user.user_id, task_date)).fetchone()[0] + 1
             task_name = f"{int(task_date[5:7])}.{int(task_date[8:10])}查重({sequence})"
             db.execute("insert into check_tasks(task_id,created_by,department_id,task_name,task_date,payload_json,config_snapshot_json,result_dir,status,created_at) values (?,?,?,?,?,?,?,?, 'running',?)", (tid, user.user_id, dept, task_name, task_date, json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, now_iso()))
         return tid
 
+    def begin_automatic_task(self, report_date: str, payload: dict[str, Any], config_snapshot: dict[str, Any], result_dir: str) -> tuple[str, bool]:
+        """Create or resume the single daily system task.  Returns (task_id, should_run)."""
+        task_date = (datetime.strptime(report_date, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+        with self.connect() as db:
+            row = db.execute("select task_id,status,attempt_count from check_tasks where trigger_source='system_daily' and task_date=?", (task_date,)).fetchone()
+            if row and row["status"] == "finished":
+                return row["task_id"], False
+            if row and row["status"] == "failed" and int(row["attempt_count"] or 0) >= 2:
+                return row["task_id"], False
+            if row:
+                db.execute("""update check_tasks set status='running', attempt_count=attempt_count+1, payload_json=?, config_snapshot_json=?, result_dir=?,
+                           result_json='{}', error_message='', finished_at='' where task_id=?""",
+                           (json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, row["task_id"]))
+                return row["task_id"], True
+            tid = token("T_", 14)
+            task_name = (
+                f"{int(report_date[5:7])}.{int(report_date[8:10])} 日报自动查重"
+                f"（{int(task_date[5:7])}.{int(task_date[8:10])} 执行）"
+            )
+            db.execute("""insert into check_tasks(task_id,created_by,department_id,task_name,task_date,trigger_source,report_date,attempt_count,
+                           payload_json,config_snapshot_json,result_dir,status,created_at)
+                           values (?,'','',?,?,'system_daily',?,1,?,?,?,'running',?)""",
+                       (tid, task_name, task_date, report_date, json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, now_iso()))
+        return tid, True
+
     def finish_task(self, task_id: str, status: str, result: dict[str, Any], error: str = "") -> None:
         with self.connect() as db: db.execute("update check_tasks set status=?,result_json=?,error_message=?,finished_at=? where task_id=?", (status, json.dumps(result, ensure_ascii=False), error, now_iso(), task_id))
 
     def list_tasks(self, user: User, filters: dict[str, Any] | None = None, include_hidden: bool = True) -> list[dict[str, Any]]:
-        filters = filters or {}; where, values = ["t.created_by=?"], [user.user_id]
+        filters = filters or {}
+        where, values = ["(t.created_by=? or t.trigger_source='system_daily')"], [user.user_id]
         if not include_hidden:
             where.append("not exists (select 1 from task_hidden_tasks h where h.user_id=? and h.task_id=t.task_id)"); values.append(user.user_id)
         for key, column in (("status", "t.status"), ("start", "t.created_at >="), ("end", "t.created_at <=")):
@@ -503,7 +539,7 @@ class SQLiteBackend(DatabaseBackend):
                 if key in {"start", "end"}: where.append(column + " ?")
                 else: where.append(column + "=?")
                 values.append(value)
-        with self.connect() as db: rows = db.execute("select t.*,u.display_name creator_name from check_tasks t join users u on u.user_id=t.created_by where " + " and ".join(where) + " order by t.created_at desc limit 200", values).fetchall()
+        with self.connect() as db: rows = db.execute("select t.*,coalesce(u.display_name,'系统') creator_name from check_tasks t left join users u on u.user_id=t.created_by where " + " and ".join(where) + " order by t.created_at desc limit 200", values).fetchall()
         out = []
         for row in rows:
             d = dict(row); result = json.loads(d.pop("result_json", "{}") or "{}"); d["payload"] = json.loads(d.pop("payload_json", "{}") or "{}"); d["summary"] = result.get("summary", {}); out.append(d)
@@ -511,7 +547,7 @@ class SQLiteBackend(DatabaseBackend):
 
     def get_task(self, task_id: str, user: User | None = None) -> dict[str, Any] | None:
         where, values = ["task_id=?"], [task_id]
-        if user: where.append("created_by=?"); values.append(user.user_id)
+        if user: where.append("(created_by=? or trigger_source='system_daily')"); values.append(user.user_id)
         with self.connect() as db: row = db.execute("select * from check_tasks where " + " and ".join(where), values).fetchone()
         if not row: return None
         d = dict(row); d["payload"] = json.loads(d.get("payload_json") or "{}"); d["config_snapshot"] = json.loads(d.get("config_snapshot_json") or "{}"); d["result"] = json.loads(d.get("result_json") or "{}"); return d
@@ -521,14 +557,16 @@ class SQLiteBackend(DatabaseBackend):
             db.execute("insert or ignore into task_hidden_tasks(user_id,task_id) select ?,task_id from check_tasks where created_by=?", (user.user_id, user.user_id))
 
     def delete_task(self, task_id: str, user: User) -> None:
-        if not self.get_task(task_id, user): raise ValueError("task not found or forbidden")
+        task = self.get_task(task_id, user)
+        if not task: raise ValueError("task not found or forbidden")
+        if task.get("trigger_source") == "system_daily": raise ValueError("系统自动任务不能删除")
         with self.connect() as db:
             db.execute("delete from task_reports where task_id=?", (task_id,))
             db.execute("delete from task_hidden_tasks where task_id=?", (task_id,))
             db.execute("delete from check_tasks where task_id=?", (task_id,))
 
     def create_reset_confirmation(self, user_id: str) -> str:
-        cid = token("RC_", 20); expires = (datetime.utcnow() + timedelta(minutes=3)).isoformat(timespec="seconds")
+        cid = token("RC_", 20); expires = (datetime.fromisoformat(now_iso()) + timedelta(minutes=3)).isoformat(timespec="seconds")
         with self.connect() as db: db.execute("delete from reset_confirmations where expires_at<=?", (now_iso(),)); db.execute("insert into reset_confirmations(confirmation_id,user_id,expires_at) values (?,?,?)", (cid, user_id, expires))
         return cid
 
@@ -564,7 +602,7 @@ class SQLiteBackend(DatabaseBackend):
             for key, value in payload.items(): db.execute("insert or replace into system_settings(setting_key,setting_value,updated_at) values (?,?,?)", (str(key), json.dumps(value, ensure_ascii=False), now_iso()))
 
     def _row_to_user(self, row: sqlite3.Row) -> User:
-        user = User(row["user_id"], row["username"], row["display_name"], row["department_id"] or "", row["department_name"] or "", row["role"], row["manager_user_id"] or "", bool(row["enabled"]), row["group_id"] or "", row["group_name"] or "")
+        user = User(row["user_id"], row["username"], row["display_name"], row["department_id"] or "", row["department_name"] or "", row["role"], row["manager_user_id"] or "", bool(row["enabled"]), row["group_id"] or "", row["group_name"] or "", "", bool(row["is_test_account"]))
         manager = self.get_derived_manager(user) if user.role in BUSINESS_ROLES else None
         user.manager_user_id = manager.user_id if manager else ""; user.manager_display_name = manager.display_name if manager else ""
         return user

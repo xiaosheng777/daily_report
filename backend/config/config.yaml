@@ -6,15 +6,6 @@ app:
   seed_demo_users: true  # 仅在空库时创建 admin / admin123 管理员
   frontend_dir: ../frontend
 
-daily_report_submission:
-  enabled: true
-  rollover_time: "09:00"
-
-automatic_daily_duplicate:
-  enabled: true
-  run_at: "12:00"
-  catch_up_on_start: true
-
 storage:
   root_dir: ../storage
   submitted_reports_dir: submitted_reports
@@ -42,7 +33,7 @@ llm_judge:
   provider: openai_compatible
   base_url: http://127.0.0.1:8080
   chat_path: /v1/chat/completions
-  # Create this file outside Git and mount it read-only in Docker.
+  # Same directory as this config.yaml (project config/ or mounted backend/config/).
   api_key_file: llm_api_key
   api_key_env: DAILY_REPORT_LLM_API_KEY
   model: internal-model-name
@@ -96,9 +87,3 @@ jplag:
   enabled: true
   jar_path: ../vendor/jplag/jplag.jar
   java_command: java
-  code_language: multi
-  code_multi_languages: c,cpp,csharp,go,java,javascript,kotlin,python3,rust,typescript
-  code_min_tokens: 12
-  code_similarity_threshold: 0.65
-  code_high_risk_threshold: 0.85
-  code_timeout_seconds: 120

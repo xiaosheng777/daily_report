@@ -4,6 +4,7 @@ import argparse
 import json
 import mimetypes
 import shutil
+import tempfile
 from datetime import datetime, timedelta
 from email.parser import BytesParser
 from email.policy import default
@@ -13,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from src.core.docx_io import build_report_docx
+from src.core.automation import DailyDuplicateScheduler
 from src.core.pipeline import DailyReportPipeline
 from src.core.schemas import Report
 from src.db.factory import create_database
@@ -27,12 +29,11 @@ from src.db.sqlite_backend import (
 from src.llm.factory import create_llm_judge
 from src.storage.file_store import FileStorage
 from src.utils.config import default_config_path, load_config
-from src.utils.dates import now_iso, parse_date, today_iso, ym
+from src.utils.dates import SHANGHAI_TIMEZONE, now_iso, parse_date, ym
 from src.utils.security import token
 
 SESSION_COOKIE = "daily_report_session"
-# 测试模式：允许按表单日期补录日报。正式启用时移除 date 并恢复 today_iso()。
-REQUIRED_REPORT_FIELDS = ("date", "title_summary", "work_description")
+REQUIRED_REPORT_FIELDS = ("title_summary", "work_description")
 RESET_CONFIRMATION_PHRASE = "清除全部业务数据"
 
 
@@ -44,11 +45,13 @@ def attachment_header(download_name: str) -> str:
 
 def flatten_settings(config: dict) -> dict:
     dd = config.get("daily_duplicate", {})
+    submission = config.get("daily_report_submission", {})
     weights = dd.get("score_weights", {})
     checks = config.get("checks", {})
     llm = config.get("llm_judge", {})
     tc = config.get("testcase_verification", {})
     return {
+        "daily_report_submission.rollover_time": str(submission.get("rollover_time", submission.get("cutoff_time", "09:00"))),
         "daily_duplicate.llm_candidate_top_n": int(dd.get("llm_candidate_top_n", 3)),
         "daily_duplicate.llm_candidate_score_threshold": float(dd.get("llm_candidate_score_threshold", 0.72)),
         "daily_duplicate.low_info_candidate_score_threshold": float(dd.get("low_info_candidate_score_threshold", 0.82)),
@@ -124,6 +127,13 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             return None
         return user
 
+    def _require_report_exporter(self):
+        user = self._require_business_user()
+        if user and user.role == "employee":
+            self._send_json({"ok": False, "error": "report_export_paused_for_employees"}, HTTPStatus.FORBIDDEN)
+            return None
+        return user
+
     def _require_admin(self):
         user = self._require_user()
         if user and not can_admin(user):
@@ -136,7 +146,9 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         query = parse_qs(parsed.query)
         try:
-            if path == "/api/auth/me":
+            if path == "/api/time":
+                self._send_json({"timezone": "Asia/Shanghai", "now": now_iso()})
+            elif path == "/api/auth/me":
                 user = self._current_user()
                 self._send_json({"authenticated": bool(user), "user": user.to_dict() if user else None})
             elif path == "/api/public/departments":
@@ -172,33 +184,35 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                 user = self._require_manager()
                 if user:
                     tasks = self.db.list_tasks(user)
-                    latest = tasks[0] if tasks else {}
+                    latest = self._task_for_view(tasks[0], user) if tasks else {}
                     s = latest.get("summary", {}) if latest else {}
-                    self._send_json({"latest_task": latest, "result_count": s.get("report_count", 0), "high_risk_count": s.get("high_risk_count", 0), "error_count": 1 if latest.get("status") == "failed" else 0, "metadata": {"report_count": len(self.db.list_reports(user))}})
+                    report_count = len(self.db.list_reports(None) if user.role == "admin" else self.db.list_reports(user))
+                    self._send_json({"latest_task": latest, "result_count": s.get("report_count", 0), "high_risk_count": s.get("high_risk_count", 0), "error_count": 1 if latest.get("status") == "failed" else 0, "metadata": {"report_count": report_count}})
             elif path == "/api/results":
                 user = self._require_manager()
                 if user:
                     tasks = self.db.list_tasks(user)
                     if not tasks: return self._send_json([])
                     task = self.db.get_task(tasks[0]["task_id"], user)
-                    self._send_json((task or {}).get("result", {}).get("report_cases", []))
+                    self._send_json(self._visible_task_cases(task or {}, user))
             elif path == "/api/tasks":
                 user = self._require_manager()
                 if user:
                     include_hidden = (query.get("include_hidden") or ["0"])[0] == "1"
-                    self._send_json(self.db.list_tasks(user, {"status": (query.get("status") or [""])[0], "start": (query.get("start") or [""])[0], "end": (query.get("end") or [""])[0]}, include_hidden=include_hidden))
+                    tasks = self.db.list_tasks(user, {"status": (query.get("status") or [""])[0], "start": (query.get("start") or [""])[0], "end": (query.get("end") or [""])[0]}, include_hidden=include_hidden)
+                    self._send_json([self._task_for_view(task, user) for task in tasks])
             elif path.startswith("/api/tasks/") and path.endswith("/results"):
                 user = self._require_manager(); tid = path.split("/")[3]
                 if user:
                     task = self.db.get_task(tid, user)
                     if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
-                    self._send_json(task.get("result", {}).get("report_cases", []))
+                    self._send_json(self._visible_task_cases(task, user))
             elif path.startswith("/api/tasks/") and path.endswith("/missing-reports"):
                 user = self._require_manager(); tid = path.split("/")[3]
                 if user:
                     task = self.db.get_task(tid, user)
                     if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
-                    self._send_json(task.get("result", {}).get("missing_reports", []))
+                    self._send_json(self._visible_missing_reports(task, user))
             elif path.startswith("/api/tasks/") and path.endswith("/export.xlsx"):
                 self._send_task_file(path.split("/")[3], "review_cases.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             elif path.startswith("/api/tasks/") and path.endswith("/export.docx"):
@@ -215,7 +229,7 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                     if not snap: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
                     self._send_bytes(self.storage.read(snap["stored_path"]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", snap["original_filename"])
             elif path == "/api/export/reports.docx":
-                user = self._require_business_user()
+                user = self._require_report_exporter()
                 if user:
                     start, end = (query.get("start") or [""])[0], (query.get("end") or [""])[0]
                     name, role = (query.get("name") or [""])[0], (query.get("role") or [""])[0]
@@ -224,7 +238,7 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                     self.db.save_export({"export_type": "weekly_reports", "created_by": user.user_id, "start_date": start, "end_date": end, "stored_path": stored.stored_path})
                     self._send_bytes(body, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", stored.original_filename)
             elif path in {"/api/export/periodic.docx", "/api/export/periodic.xlsx"}:
-                user = self._require_business_user()
+                user = self._require_report_exporter()
                 if user:
                     report_type, start, end = _periodic_export_args(query)
                     reports = self.db.list_reports(user, start, end)
@@ -326,7 +340,8 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             elif path in {"/api/run", "/api/tasks"}:
                 user = self._require_manager()
                 if user:
-                    payload = {"report_date_start": today_iso(), "report_date_end": today_iso()} if path == "/api/run" else self._read_json_body()
+                    report_date = self._new_report_date()
+                    payload = {"report_date_start": report_date, "report_date_end": report_date} if path == "/api/run" else self._read_json_body()
                     start, end = str(payload.get("report_date_start") or ""), str(payload.get("report_date_end") or "")
                     if not start or not end:
                         raise ValueError("查重任务必须选择开始日期和结束日期")
@@ -356,9 +371,6 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             elif path == "/api/admin/cleanup-sessions":
                 user = self._require_admin();
                 if user: self._send_json({"ok": True, "deleted": self.db.cleanup_sessions()})
-            elif path == "/api/admin/backup":
-                user = self._require_admin();
-                if user: self._send_json(self._create_backup(user.user_id))
             elif path == "/api/tasks/display/clear":
                 user = self._require_manager()
                 if user: self.db.clear_task_page_display(user); self._send_json({"ok": True})
@@ -422,8 +434,9 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                     testcase_files = files.get("testcase_files", [])
                     if testcase_files:
                         payload["testcase_items"] = self._parse_testcase_upload(testcase_files[0])
-                    report = self._report_from_payload(user, payload, old.report_date)
-                    report.report_id, report.created_at, report.updated_at = rid, old.created_at, now_iso()
+                    self._ensure_report_editable(old)
+                    report = self._report_from_payload(user, payload, old.report_date, old.created_at)
+                    report.report_id, report.updated_at = rid, now_iso()
                     self.db.save_report(report)
                     for f in files.get("code_files", []): self._save_artifact(report, user, f, "code")
                     for f in files.get("document_files", []): self._save_artifact(report, user, f, "document")
@@ -470,12 +483,69 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         if not user: return
         task = self.db.get_task(task_id, user)
         if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
-        path = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id / name
-        if not path.exists(): return self._send_json({"ok": False, "error": "file_not_found"}, HTTPStatus.NOT_FOUND)
-        self._send_bytes(path.read_bytes(), content_type, name)
+        if task.get("trigger_source") != "system_daily":
+            path = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id / name
+            if not path.exists(): return self._send_json({"ok": False, "error": "file_not_found"}, HTTPStatus.NOT_FOUND)
+            return self._send_bytes(path.read_bytes(), content_type, name)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / name
+            if name == "review_cases.xlsx":
+                DailyReportPipeline.export_review_xlsx(self._visible_task_cases(task, user), output)
+            elif name == "review_cases.docx":
+                DailyReportPipeline.export_review_docx(self._visible_task_cases(task, user), output)
+            elif name == "missing_reports.xlsx":
+                DailyReportPipeline.export_missing_reports_xlsx(self._visible_missing_reports(task, user), output)
+            else:
+                return self._send_json({"ok": False, "error": "file_not_found"}, HTTPStatus.NOT_FOUND)
+            self._send_bytes(output.read_bytes(), content_type, name)
+
+    @staticmethod
+    def _row_visible_to_manager(row: dict, user) -> bool:
+        if user.role in {"minister", "admin"}:
+            return True
+        if user.role == "director":
+            return row.get("department_id") == user.department_id or row.get("department_name") == user.department_name
+        if user.role == "group_leader":
+            return row.get("owner_user_id") == user.user_id or row.get("user_id") == user.user_id or row.get("group_id") == user.group_id or row.get("group_name") == user.group_name
+        return False
+
+    def _visible_task_cases(self, task: dict, user) -> list[dict]:
+        cases = task.get("result", {}).get("report_cases", [])
+        if task.get("trigger_source") != "system_daily":
+            return cases
+        return [case for case in cases if self._row_visible_to_manager(case, user)]
+
+    def _visible_missing_reports(self, task: dict, user) -> list[dict]:
+        rows = task.get("result", {}).get("missing_reports", [])
+        if task.get("trigger_source") != "system_daily":
+            return rows
+        return [row for row in rows if self._row_visible_to_manager(row, user)]
+
+    def _task_for_view(self, task: dict, user) -> dict:
+        if task.get("trigger_source") != "system_daily":
+            return task
+        full_task = self.db.get_task(task["task_id"], user) or task
+        cases = self._visible_task_cases(full_task, user)
+        missing = self._visible_missing_reports(full_task, user)
+        view = dict(task)
+        view["summary"] = {
+            "report_count": len(cases),
+            "high_risk_count": sum(1 for case in cases if case.get("overall_risk") == "high"),
+            "medium_risk_count": sum(1 for case in cases if case.get("overall_risk") == "medium"),
+            "missing_report_count": len(missing),
+        }
+        return view
 
     @staticmethod
     def _validate_settings_payload(payload: dict) -> None:
+        rollover_time = payload.get("daily_report_submission.rollover_time")
+        if rollover_time is not None:
+            try:
+                hour, minute = (int(part) for part in str(rollover_time).split(":", 1))
+            except (TypeError, ValueError):
+                raise ValueError("日报归属切换时间须为 HH:MM 格式")
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("日报归属切换时间须在 00:00 至 23:59 之间")
         medium = payload.get("testcase_verification.self_history_medium_rate")
         high = payload.get("testcase_verification.self_history_high_rate")
         if medium is None and high is None:
@@ -509,20 +579,24 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             raise ValueError("小组不存在或不在本部门范围内")
         return match["group_id"], match.get("name", ""), user.department_id, user.department_name
 
-    def _report_from_payload(self, user, payload: dict, report_date: str | None = None) -> Report:
+    def _report_from_payload(self, user, payload: dict, report_date: str | None = None, created_at: str | None = None) -> Report:
         missing = [f for f in REQUIRED_REPORT_FIELDS if not str(payload.get(f, "")).strip()]
         if missing: raise ValueError(f"缺少必填字段: {', '.join(missing)}")
+        if str(payload.get("submitted_at") or "").strip():
+            raise ValueError("提交时间由服务器按上海时间自动生成，不能手动指定")
         derived_manager = self.db.get_derived_manager(user)
         manager = derived_manager.display_name if derived_manager else str(payload.get("manager") or "").strip()
+        if getattr(user, "is_test_account", False) and not manager:
+            manager = "测试负责人"
         if user.role != ROLE_MINISTER and not manager:
             raise ValueError("直属领导尚未建立，请手工填写")
-        # 测试模式：新日报采用用户选择的日期；编辑原日报时仍保留原日期。
-        # 正式启用时改回：report_date or today_iso()
+        effective_report_date = report_date or self._new_report_date()
+        actual_created_at = created_at or now_iso()
         report = Report("", user.user_id, user.display_name, user.department_id, user.department_name,
-                        report_date or parse_date(str(payload["date"])), manager, str(payload.get("title_summary") or ""),
+                        effective_report_date, manager, str(payload.get("title_summary") or ""),
                         str(payload.get("work_description") or ""), code_items=payload.get("code_items") or [],
                         document_items=payload.get("document_items") or [], testcase_items=payload.get("testcase_items") or [],
-                        created_at=now_iso(), group_id=user.group_id, group_name=user.group_name,
+                        created_at=actual_created_at, group_id=user.group_id, group_name=user.group_name,
                         submitter_role=user.role)
         from src.core.pipeline import DailyReportPipeline
         report.report_id = DailyReportPipeline.build_report_id(report)
@@ -530,6 +604,45 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         stored = self.storage.save_bytes("submitted_reports", f"SR_{report.report_date}_{report.employee_name}.docx", body, report.report_date)
         report.original_filename, report.stored_path, report.file_size, report.content_hash = stored.original_filename, stored.stored_path, stored.file_size, stored.content_hash
         return report
+
+    def _submission_rules(self) -> dict:
+        defaults = flatten_settings(self.config)
+        get_settings = getattr(self.db, "get_settings", None)
+        if not callable(get_settings):
+            return self.config.get("daily_report_submission", {})
+        effective = apply_flat_settings(self.config, get_settings(defaults))
+        return effective.get("daily_report_submission", {})
+
+    def _submission_now(self) -> datetime:
+        return datetime.now(SHANGHAI_TIMEZONE)
+
+    def _rollover_time(self) -> tuple[int, int]:
+        rules = self._submission_rules()
+        cutoff = str(rules.get("rollover_time", rules.get("cutoff_time", "09:00")))
+        hour, minute = (int(part) for part in cutoff.split(":", 1))
+        return hour, minute
+
+    def _new_report_date(self, now: datetime | None = None) -> str:
+        current = now or self._submission_now()
+        if not self._submission_rules().get("enabled", True):
+            return current.date().isoformat()
+        hour, minute = self._rollover_time()
+        if (current.hour, current.minute, current.second) < (hour, minute, 0):
+            return (current.date() - timedelta(days=1)).isoformat()
+        return current.date().isoformat()
+
+    def _ensure_report_editable(self, report: Report, now: datetime | None = None) -> None:
+        current = now or self._submission_now()
+        if not self._submission_rules().get("enabled", True):
+            return
+        today = current.date().isoformat()
+        previous = (current.date() - timedelta(days=1)).isoformat()
+        hour, minute = self._rollover_time()
+        if report.report_date == today:
+            return
+        if report.report_date == previous and (current.hour, current.minute, current.second) < (hour, minute, 0):
+            return
+        raise ValueError("该日报已超过可编辑时间")
 
     def _save_artifact(self, report: Report, user, file_item, artifact_type: str) -> str:
         stored = self.storage.save_bytes(f"artifacts/{artifact_type}", file_item.filename, file_item.data, report.report_date)
@@ -576,12 +689,19 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                 "group_name": report.group_name, "submitter_role": report.submitter_role,
                 "report_date": report.report_date, "title_summary": report.title_summary,
                 "original_filename": report.original_filename, "created_at": report.created_at, "updated_at": report.updated_at,
-                "status": report.status, "can_edit": bool(viewer and viewer.user_id == report.owner_user_id),
+                "status": report.status, "can_edit": bool(viewer and viewer.user_id == report.owner_user_id and self._is_report_editable(report)),
                 "code_item_count": len(report.code_items), "document_item_count": len(report.document_items),
                 "artifacts": self.db.list_artifacts_for_report(report.report_id)}
 
     def _report_detail(self, report: Report) -> dict:
         return report.to_dict() | {"artifacts": self.db.list_artifacts_for_report(report.report_id)}
+
+    def _is_report_editable(self, report: Report) -> bool:
+        try:
+            self._ensure_report_editable(report)
+            return True
+        except ValueError:
+            return False
 
     def _clear_business_storage(self) -> int:
         root = Path(self.config["storage"]["root_dir"]).resolve()
@@ -602,16 +722,8 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file()) if root.exists() else 0
         return {"root_dir": str(root), "bytes": size, "mb": round(size / 1024 / 1024, 2)}
 
-    def _create_backup(self, user_id: str) -> dict:
-        root = Path(self.config["storage"]["root_dir"]); backups = root / "backups"; backups.mkdir(parents=True, exist_ok=True)
-        name = f"storage_backup_{now_iso().replace(':','-')}.zip"; archive_base = backups / name.replace(".zip", "")
-        shutil.make_archive(str(archive_base), "zip", root)
-        self.db.save_export({"export_type": "storage_backup", "created_by": user_id, "stored_path": str((backups / name).relative_to(root))})
-        return {"ok": True, "file": str(backups / name)}
-
-
 def _report_to_payload(report: Report) -> dict:
-    return {"name": report.employee_name, "department": report.department_name, "date": report.report_date, "manager": report.manager, "title_summary": report.title_summary, "work_description": report.work_description, "code_items": report.code_items, "document_items": report.document_items, "testcase_items": report.testcase_items}
+    return {"name": report.employee_name, "department": report.department_name, "report_date": report.report_date, "submitted_at": report.created_at, "manager": report.manager, "title_summary": report.title_summary, "work_description": report.work_description, "code_items": report.code_items, "document_items": report.document_items, "testcase_items": report.testcase_items}
 
 
 def _build_reports_docx(reports: list[Report]) -> bytes:
@@ -619,7 +731,7 @@ def _build_reports_docx(reports: list[Report]) -> bytes:
     from docx import Document
     doc = Document(); doc.add_heading("周报汇总", level=1); doc.add_paragraph(f"共 {len(reports)} 份日报")
     table = doc.add_table(rows=1, cols=8); table.style = "Table Grid"
-    for i, h in enumerate(["日期", "姓名", "职务", "部门", "小组", "标题", "状态", "提交时间"]): table.rows[0].cells[i].text = h
+    for i, h in enumerate(["查重归属日期", "姓名", "职务", "部门", "小组", "标题", "状态", "提交时间"]): table.rows[0].cells[i].text = h
     for r in reports:
         row = table.add_row().cells
         for i, v in enumerate([r.report_date, r.employee_name, r.submitter_role, r.department_name, r.group_name, r.title_summary, r.status, r.created_at]): row[i].text = str(v or "")
@@ -704,7 +816,7 @@ def _build_periodic_reports_docx(title: str, scope: str, start: str, end: str, r
     if not reports and not missing_reports:
         doc.add_paragraph("暂无日报")
     for report in sorted(reports, key=lambda item: (item.report_date, item.employee_name, item.created_at)):
-        doc.add_heading(f"{report.report_date} · {report.employee_name}", level=2)
+        doc.add_heading(f"查重归属：{report.report_date} · {report.employee_name}", level=2)
         doc.add_paragraph(f"职务：{report.submitter_role}；部门/小组：{report.department_name or '—'} / {report.group_name or '—'}")
         doc.add_paragraph(f"提交时间：{report.created_at or '—'}；最后修改：{report.updated_at or '—'}")
         doc.add_paragraph(f"标题：{report.title_summary}")
@@ -724,7 +836,7 @@ def _build_periodic_reports_xlsx(title: str, scope: str, start: str, end: str, r
     wb = Workbook()
     summary = wb.active; summary.title = "日报明细"
     summary.append(["报表", title, "范围", scope, "开始日期", start, "结束日期", end])
-    summary.append(["日报ID", "日期", "姓名", "职务", "部门", "小组", "标题", "工作描述", "提交时间", "最后修改时间", "状态"])
+    summary.append(["日报ID", "查重归属日期", "姓名", "职务", "部门", "小组", "标题", "工作描述", "提交时间", "最后修改时间", "状态"])
     ordered = sorted(reports, key=lambda item: (item.report_date, item.employee_name, item.created_at))
     for report in ordered:
         summary.append([report.report_id, report.report_date, report.employee_name, report.submitter_role, report.department_name, report.group_name, report.title_summary, report.work_description, report.created_at, report.updated_at, "已提交"])
@@ -740,7 +852,7 @@ def _build_periodic_reports_xlsx(title: str, scope: str, start: str, end: str, r
 
     code_rows, document_rows, testcase_rows, artifact_rows = [], [], [], []
     for report in ordered:
-        prefix = {"日报ID": report.report_id, "日期": report.report_date, "姓名": report.employee_name}
+        prefix = {"日报ID": report.report_id, "查重归属日期": report.report_date, "提交时间": report.created_at, "姓名": report.employee_name}
         code_rows.extend([prefix | item for item in report.code_items])
         document_rows.extend([prefix | item for item in report.document_items])
         testcase_rows.extend([prefix | item for item in report.testcase_items])
@@ -757,7 +869,14 @@ def run_server(config_path: str, host: str | None = None, port: int | None = Non
     DailyReportHandler.config = config; DailyReportHandler.storage = storage; DailyReportHandler.db = db
     bind_host = host or str(config.get("app", {}).get("host", "0.0.0.0")); bind_port = int(port or config.get("app", {}).get("port", 8000))
     server = ThreadingHTTPServer((bind_host, bind_port), DailyReportHandler)
-    print(f"Daily Report V2 backend running at http://{bind_host}:{bind_port}"); server.serve_forever()
+    scheduler = DailyDuplicateScheduler(config, db, storage)
+    scheduler.start()
+    print(f"Daily Report V2 backend running at http://{bind_host}:{bind_port}")
+    try:
+        server.serve_forever()
+    finally:
+        scheduler.stop()
+        server.server_close()
 
 
 def main() -> None:

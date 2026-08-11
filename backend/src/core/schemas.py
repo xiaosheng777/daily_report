@@ -17,6 +17,7 @@ class User:
     group_id: str = ""
     group_name: str = ""
     manager_display_name: str = ""
+    is_test_account: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,7 +93,10 @@ class ReviewCase:
     owner_user_id: str
     department_id: str
     department_name: str
+    group_id: str
+    group_name: str
     report_date: str
+    submitted_at: str
     title_summary: str
     overall_risk: str
     triggered_checks: list[str]

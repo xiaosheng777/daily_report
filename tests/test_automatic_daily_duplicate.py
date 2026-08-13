@@ -11,7 +11,7 @@ from src.web.app import DailyReportHandler
 from test_organization import as_user, build_org
 
 
-def test_system_task_is_unique_and_failed_task_can_resume(tmp_path):
+def test_system_task_is_unique_and_failed_task_requires_manual_retry(tmp_path):
     db = build_org(tmp_path)
     payload = {"report_date_start": "2026-07-30", "report_date_end": "2026-07-30"}
     task_id, should_run = db.begin_automatic_task("2026-07-30", payload, {}, "tasks/pending")
@@ -22,12 +22,12 @@ def test_system_task_is_unique_and_failed_task_can_resume(tmp_path):
 
     retry_id, retry = db.begin_automatic_task("2026-07-31", payload, {}, "tasks/pending")
     db.finish_task(retry_id, "failed", {}, "model unavailable")
-    assert db.begin_automatic_task("2026-07-31", payload, {}, "tasks/pending") == (retry_id, True)
-    db.finish_task(retry_id, "failed", {}, "model unavailable")
     assert db.begin_automatic_task("2026-07-31", payload, {}, "tasks/pending") == (retry_id, False)
+    assert db.retry_task(retry_id, as_user(db, "leader1")) is True
+    assert db.get_task(retry_id)["status"] == "queued"
 
 
-def test_scheduler_runs_at_noon_once_and_not_before(monkeypatch, tmp_path):
+def test_scheduler_enqueues_at_noon_once_and_not_before(tmp_path):
     calls = []
 
     class Db:
@@ -35,17 +35,6 @@ def test_scheduler_runs_at_noon_once_and_not_before(monkeypatch, tmp_path):
             calls.append((report_date, payload))
             return "T_auto", len(calls) == 1
 
-        def finish_task(self, *args):
-            calls.append(("finish", args))
-
-    class Pipeline:
-        def __init__(self, *args):
-            pass
-
-        def run(self, *args):
-            return {"summary": {"report_count": 0}}
-
-    monkeypatch.setattr("src.core.automation.DailyReportPipeline", Pipeline)
     config = {"storage": {"root_dir": str(tmp_path)}, "llm_judge": {"enabled": False}, "automatic_daily_duplicate": {"enabled": True, "timezone": "Asia/Shanghai", "run_at": "12:00", "catch_up_on_start": True}}
     scheduler = DailyDuplicateScheduler(config, Db(), None)
     tz = ZoneInfo("Asia/Shanghai")
@@ -53,6 +42,7 @@ def test_scheduler_runs_at_noon_once_and_not_before(monkeypatch, tmp_path):
     assert scheduler.run_due(datetime(2026, 7, 31, 12, 0, tzinfo=tz)) == ("T_auto", True)
     assert scheduler.run_due(datetime(2026, 7, 31, 12, 1, tzinfo=tz)) == ("T_auto", False)
     assert calls[0][0] == "2026-07-30"
+    assert not any(call[0] == "finish" for call in calls)
 
 
 def test_system_task_results_are_filtered_by_manager_scope(tmp_path):

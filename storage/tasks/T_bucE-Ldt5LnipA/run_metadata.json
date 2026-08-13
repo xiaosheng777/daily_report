@@ -1,0 +1,122 @@
+{
+  "generated_at": "2026-08-10T12:00:14",
+  "config": {
+    "app": {
+      "host": "0.0.0.0",
+      "port": 8000,
+      "secure_cookie": false,
+      "allow_self_register": true,
+      "seed_demo_users": true,
+      "frontend_dir": "E:\\631\\daily_report\\daily_report\\frontend"
+    },
+    "storage": {
+      "root_dir": "E:\\631\\daily_report\\daily_report\\storage",
+      "submitted_reports_dir": "submitted_reports",
+      "artifacts_dir": "artifacts",
+      "testcase_snapshots_dir": "testcase_snapshots",
+      "tasks_dir": "tasks",
+      "exports_dir": "exports",
+      "backups_dir": "backups",
+      "project_root": "E:\\631\\daily_report\\daily_report"
+    },
+    "upload": {
+      "max_file_mb": 50,
+      "allowed_code_ext": [
+        ".zip",
+        ".py",
+        ".java",
+        ".js",
+        ".ts",
+        ".cpp",
+        ".c",
+        ".cs",
+        ".go",
+        ".rs",
+        ".php",
+        ".rb",
+        ".html",
+        ".css"
+      ],
+      "allowed_document_ext": [
+        ".docx",
+        ".pdf",
+        ".txt",
+        ".md",
+        ".xlsx"
+      ],
+      "allowed_testcase_ext": [
+        ".xlsx"
+      ]
+    },
+    "database": {
+      "backend": "sqlite",
+      "sqlite_path": "E:\\631\\daily_report\\daily_report\\storage\\daily_report.sqlite3"
+    },
+    "llm_judge": {
+      "enabled": false,
+      "provider": "openai_compatible",
+      "base_url": "http://127.0.0.1:8080",
+      "chat_path": "/v1/chat/completions",
+      "api_key_file": "E:\\631\\daily_report\\daily_report\\config\\llm_api_key",
+      "api_key_env": "DAILY_REPORT_LLM_API_KEY",
+      "model": "internal-model-name",
+      "temperature": 0,
+      "timeout_seconds": 180,
+      "max_tokens": 1024,
+      "max_retries": 2,
+      "raw_log_path": "E:\\631\\daily_report\\daily_report\\storage\\llm_raw_logs.jsonl"
+    },
+    "daily_duplicate": {
+      "self_history_days": 30,
+      "cross_user_days": 3,
+      "cross_user_scope": "department",
+      "max_candidates": 20,
+      "llm_candidate_top_n": 3,
+      "llm_candidate_score_threshold": 0.72,
+      "low_info_candidate_score_threshold": 0.82,
+      "no_candidate_threshold": 0.55,
+      "score_weights": {
+        "text": 0.45,
+        "semantic": 0.45,
+        "recency": 0.1
+      }
+    },
+    "testcase_verification": {
+      "enabled": true,
+      "snapshot_scope": "group",
+      "baseline_strategy": "latest_before_report_date",
+      "allow_overwrite_same_day_snapshot": true,
+      "self_history_days": 7,
+      "self_history_high_rate": 0.5,
+      "self_history_medium_rate": 0.2,
+      "compare_fields": [
+        "描述",
+        "测试用例设计说明",
+        "具体步骤",
+        "期望结果"
+      ]
+    },
+    "checks": {
+      "low_information_min_length": 10,
+      "description_too_short_length": 12,
+      "code_history_days": 30,
+      "code_token_similarity_threshold": 0.65,
+      "code_token_high_risk_threshold": 0.85,
+      "document_history_days": 30,
+      "document_token_similarity_threshold": 0.65,
+      "document_token_high_risk_threshold": 0.85,
+      "enable_code_check": true,
+      "enable_document_check": true
+    },
+    "jplag": {
+      "enabled": true,
+      "jar_path": "E:\\631\\daily_report\\daily_report\\vendor\\jplag\\jplag.jar",
+      "java_command": "java"
+    },
+    "config_path": "E:\\631\\daily_report\\daily_report\\config\\config.yaml",
+    "config_dir": "E:\\631\\daily_report\\daily_report\\config",
+    "backend_root": "E:\\631\\daily_report\\daily_report\\backend",
+    "project_root": "E:\\631\\daily_report\\daily_report"
+  },
+  "user": null
+}

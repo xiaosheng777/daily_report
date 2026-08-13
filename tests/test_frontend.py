@@ -17,12 +17,17 @@ def test_auth_and_role_navigation_guards_are_present():
     assert "function canManage(){return ['group_leader','director','minister'].includes(state.user?.role)}" in script
     assert "function canExportReports()" in script
     assert "daily_report_submission.rollover_time':'日报归属切换时间'" in script
+    assert "daily_duplicate.worker_count':'单任务并行数（1-8）'" in script
     assert "type=\"${isTime?'time':'text'}\"" in script
     assert "日报自动查重（${format(t.task_date)} 执行）" in script
     assert "if(!canAccessPanel(id)||!document.getElementById(id))return false" in script
     assert "function renderMatchDetails(f)" in script
     assert "Token 查重" in script
     assert "function refreshShanghaiClock()" in script
+    assert "function waitForCheckTask(taskId,startedAt)" in script
+    assert "/status`" in script
+    assert "data-retry-task" in script
+    assert "data-cancel-task" in script
     assert "timeZone:'Asia/Shanghai'" in script
     assert ".report-form > .submission-time-field" in styles
     assert ".report-form > .manager-field" in styles

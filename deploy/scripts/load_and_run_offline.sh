@@ -13,7 +13,7 @@ if [ ! -f "$APP_DIR/config/llm_api_key" ]; then
   exit 1
 fi
 cd "$APP_DIR"
-docker rm -f daily-report-web daily-report-backend >/dev/null 2>&1 || true
+docker rm -f daily-report-web daily-report-worker daily-report-backend >/dev/null 2>&1 || true
 docker network create daily-report-net >/dev/null 2>&1 || true
 
 docker run -d \
@@ -24,6 +24,17 @@ docker run -d \
   -v "$APP_DIR/config/llm_api_key:/app/backend/config/llm_api_key:ro" \
   -v "$APP_DIR/storage:/app/storage" \
   "$BACKEND_IMAGE"
+
+docker run -d \
+  --name daily-report-worker \
+  --restart always \
+  --network daily-report-net \
+  --cpus 2 \
+  --memory 2g \
+  -v "$APP_DIR/config/config.yaml:/app/backend/config/config.yaml:ro" \
+  -v "$APP_DIR/config/llm_api_key:/app/backend/config/llm_api_key:ro" \
+  -v "$APP_DIR/storage:/app/storage" \
+  "$BACKEND_IMAGE" python -m src.worker --config config/config.yaml
 
 docker run -d \
   --name daily-report-web \

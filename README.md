@@ -16,6 +16,7 @@
 - 文件保存改为文件系统：`storage/` 存真实文件，SQLite 只存 metadata/path/hash。
 - 每次查重都是独立 task：`storage/tasks/<task_id>/` 保存 JSON、Excel、Word、metadata、error。
 - 日报主查重改为 top-N 多候选、多 finding、加权 score、跨人协作判断 prompt。
+- 人工与 12:00 自动查重进入同一个持久队列，由独立 worker 单任务串行执行；Web 服务不再承担重型查重计算。
 - top-N、阈值、权重都可在管理员页面调整。
 - 测试用例 Excel 由组长或主任上传本部门每日总表。
 - 测试用例 baseline 改为 report_date 之前最近一份部门快照。
@@ -83,6 +84,14 @@ pip install -r requirements.txt
 python -m src.web.app --host 0.0.0.0 --port 8000
 ```
 
+另开一个终端，在同一虚拟环境和 `backend/` 目录启动唯一的查重 worker：
+
+```bash
+python -m src.worker --config ../config/config.yaml
+```
+
+Web 进程只接收请求和创建排队任务；人工查重与 12:00 自动查重由 worker 串行执行。worker 重启后，排队任务保留，已中断的运行任务会标记失败并允许手动重试。
+
 默认会自动加载项目根目录的 `config/config.yaml`（不再优先使用 `backend/config/`）。
 
 访问：
@@ -137,5 +146,7 @@ bash deploy/scripts/pull_base_images_one_by_one.sh
 ```bash
 bash deploy/scripts/build_backend_image.sh
 ```
+
+推荐使用 `docker compose up -d` 启动 backend、受 2 CPU/2 GB 限制的独立 worker 和 nginx。
 
 详见 `DEPLOY.md`。

@@ -5,12 +5,13 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 import zipfile
-from datetime import timedelta
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from docx import Document
 from openpyxl import Workbook, load_workbook
@@ -32,6 +33,10 @@ from src.storage.file_store import FileStorage
 from src.utils.dates import days_between, now_iso, parse_date
 
 
+class TaskCancelled(RuntimeError):
+    """Raised at task checkpoints after a persisted cancellation request."""
+
+
 class DailyReportPipeline:
     def __init__(self, config: dict[str, Any], db: DatabaseBackend, storage: FileStorage, llm_judge: LLMJudge | None = None) -> None:
         self.config = config
@@ -41,13 +46,41 @@ class DailyReportPipeline:
         self.daily_cfg = config.get("daily_duplicate", {})
         self.checks = config.get("checks", {})
         self._code_token_cache: dict[str, tuple[list[str], int]] = {}
+        self._artifact_cache: dict[str, list[dict[str, Any]]] = {}
+        self._document_text_cache: dict[str, str] = {}
+        self._testcase_rows_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self._snapshot_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._task_reports_all: list[Report] = []
+        self._normalized_text_by_id: dict[str, str] = {}
+        self._text_hash_by_id: dict[str, str] = {}
+        self._llm_calls = 0
+        self._llm_failures = 0
+        self._llm_circuit_open = False
+        self._started_monotonic = time.monotonic()
 
-    def run(self, user: User | None = None, scope: dict[str, Any] | None = None, task_id: str = "", result_dir: str = "") -> dict[str, Any]:
+    def run(
+        self,
+        user: User | None = None,
+        scope: dict[str, Any] | None = None,
+        task_id: str = "",
+        result_dir: str = "",
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+        case_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         scope = scope or {}
+        progress = progress_callback or (lambda _stage, _current, _total, _message="": None)
+        progress("loading", 0, 0, "正在加载查重范围内的日报")
         # Candidate data must stay inside the initiator's organisation scope.
-        reports_all = self.db.list_reports(None) if not user or user.role == "admin" else self.db.list_reports(user)
+        history_start = self._history_start(str(scope.get("report_date_start") or ""))
+        history_end = str(scope.get("report_date_end") or "")
+        reports_all = self.db.list_reports(None, start=history_start, end=history_end) if not user or user.role == "admin" else self.db.list_reports(user, start=history_start, end=history_end)
+        self._task_reports_all = reports_all
+        list_artifacts = getattr(self.db, "list_artifacts_for_reports", None)
+        if callable(list_artifacts):
+            self._artifact_cache.update(list_artifacts([report.report_id for report in reports_all]))
         current_reports = self._filter_current_reports(reports_all, user, scope)
-        cases = self._build_cases(current_reports, reports_all)
+        progress("preparing", 0, len(current_reports), f"已加载 {len(reports_all)} 份候选日报")
+        cases = self._build_cases(current_reports, reports_all, progress, case_callback)
         missing_reports = self._find_missing_reports(current_reports, user, scope)
         payload = {
             "task_id": task_id,
@@ -67,8 +100,23 @@ class DailyReportPipeline:
             "missing_reports": missing_reports,
         }
         if task_id and result_dir:
+            progress("exporting", len(cases), len(cases), "正在生成任务结果文件")
             self._persist_task_outputs(payload, Path(result_dir), user)
+        progress("finished", len(cases), len(cases), "查重完成")
         return payload
+
+    def _history_start(self, start: str) -> str:
+        if not start:
+            return ""
+        windows = [
+            int(self.daily_cfg.get("self_history_days", 30)),
+            int(self.daily_cfg.get("cross_user_days", 3)),
+            int(self.checks.get("code_history_days", 30)),
+            int(self.checks.get("document_history_days", 30)),
+            int(self.config.get("testcase_verification", {}).get("self_history_days", 7)),
+        ]
+        earliest = datetime.strptime(parse_date(start), "%Y-%m-%d").date() - timedelta(days=max(windows))
+        return earliest.isoformat()
 
     def _persist_task_outputs(self, payload: dict[str, Any], result_dir: Path, user: User | None) -> None:
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -132,8 +180,17 @@ class DailyReportPipeline:
                     missing.append({"report_date": report_date, "user_id": submitter["user_id"], "employee_name": submitter["display_name"], "role": submitter["role"], "department_id": submitter.get("department_id", ""), "department_name": submitter.get("department_name", ""), "group_id": submitter.get("group_id", ""), "group_name": submitter.get("group_name", "")})
         return missing
 
-    def _build_cases(self, current_reports: list[Report], all_reports: list[Report]) -> list[ReviewCase]:
+    def _build_cases(
+        self,
+        current_reports: list[Report],
+        all_reports: list[Report],
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+        case_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[ReviewCase]:
+        progress = progress_callback or (lambda _stage, _current, _total, _message="": None)
         texts = [normalize_text(r.title_summary, r.work_description) for r in all_reports]
+        self._normalized_text_by_id = {report.report_id: text for report, text in zip(all_reports, texts)}
+        self._text_hash_by_id = {report_id: stable_hash(text) for report_id, text in self._normalized_text_by_id.items()}
         matrix = None
         try:
             if any(texts):
@@ -144,26 +201,47 @@ class DailyReportPipeline:
         index_by_id = {r.report_id: i for i, r in enumerate(all_reports)}
         group_extras_cache: dict[tuple[str, str], list[Finding]] = {}
         cases: list[ReviewCase] = []
-        for report in current_reports:
+        total = len(current_reports)
+        for position, report in enumerate(current_reports, 1):
+            progress("checking", position - 1, total, f"正在检查第 {position}/{total} 份日报")
+            duplicate_check = self._safe_check(
+                "report_duplicate_check", report,
+                lambda report=report: self._daily_duplicate_check(report, all_reports, index_by_id, matrix),
+            )
             checks: list[CheckResult] = [
                 self._quality_check(report),
-                self._daily_duplicate_check(report, all_reports, index_by_id, matrix),
-                self._testcase_check(report, all_reports, group_extras_cache),
+                duplicate_check,
+                self._safe_check("testcase_check", report, lambda report=report: self._testcase_check(report, all_reports, group_extras_cache)),
             ]
             if self.checks.get("enable_code_check", True):
-                code = self._code_token_check(report)
+                code = self._safe_check("code_check", report, lambda report=report: self._code_token_check(report))
                 if code.triggered:
                     checks.append(code)
             if self.checks.get("enable_document_check", True):
-                doc = self._document_token_check(report)
+                doc = self._safe_check("document_check", report, lambda report=report: self._document_token_check(report))
                 if doc.triggered:
                     checks.append(doc)
             triggered = [c.checker_id for c in checks if c.triggered]
             risk = highest_risk(c.risk_level for c in checks if c.triggered) if triggered else "normal"
-            cases.append(ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
-                                    report.department_name, report.group_id, report.group_name, report.report_date,
-                                    report.created_at, report.title_summary, risk, triggered, checks))
+            case = ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
+                              report.department_name, report.group_id, report.group_name, report.report_date,
+                              report.created_at, report.title_summary, risk, triggered, checks)
+            cases.append(case)
+            if case_callback:
+                case_callback(case.to_dict())
+            progress("checking", position, total, f"已完成 {position}/{total} 份日报")
         return cases
+
+    @staticmethod
+    def _safe_check(checker_id: str, report: Report, callback: Callable[[], CheckResult]) -> CheckResult:
+        try:
+            return callback()
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            summary = f"{checker_id} 执行失败：{exc}"
+            return CheckResult(checker_id, True, "failed", "unknown", summary,
+                               [Finding(checker_id, "unknown", "execution_failed", report.title_summary, reason=summary)])
 
     def _quality_check(self, report: Report) -> CheckResult:
         issues = []
@@ -196,20 +274,34 @@ class DailyReportPipeline:
             risk = "high" if cand["hash_same"] else "medium" if cand["candidate_score"] >= 0.75 else "low"
             reason = "标准化后文本完全一致" if cand["hash_same"] else f"候选相似度 {cand['candidate_score']:.2f}，建议复核"
             details = self._candidate_details(cand)
-            if self.llm_judge and not cand["hash_same"] and cand["candidate_score"] >= llm_threshold:
+            llm_cfg = self.config.get("llm_judge", {})
+            llm_budget = max(0, int(llm_cfg.get("max_reports_per_task", 60)))
+            llm_deadline = max(0, int(llm_cfg.get("task_cutoff_seconds", 2700)))
+            llm_allowed = (
+                self.llm_judge and not self._llm_circuit_open and self._llm_calls < llm_budget
+                and time.monotonic() - self._started_monotonic < llm_deadline
+            )
+            if llm_allowed and not cand["hash_same"] and cand["candidate_score"] >= llm_threshold:
+                self._llm_calls += 1
                 result = self.llm_judge.judge_duplicate(current.to_dict(), other.to_dict(), details)
                 details["llm_called"] = True
                 if result.ok:
+                    self._llm_failures = 0
                     risk = result.duplicate_risk
                     reason = result.decision_summary or reason
                     details["llm_confidence"] = result.confidence
                     details["llm_raw"] = result.raw
                 else:
-                    risk = "unknown"
-                    reason = f"大模型调用失败：{result.error}"
+                    self._llm_failures += 1
+                    if self._llm_failures >= 3:
+                        self._llm_circuit_open = True
+                    reason = f"大模型调用失败，已使用本地相似度：{result.error}"
                     details["llm_error"] = result.error
+                    details["degraded_reason"] = "llm_circuit_open" if self._llm_circuit_open else "llm_call_failed"
             else:
                 details["llm_called"] = False
+                if self.llm_judge and not cand["hash_same"] and cand["candidate_score"] >= llm_threshold:
+                    details["degraded_reason"] = "llm_circuit_open" if self._llm_circuit_open else "llm_budget_or_deadline"
             findings.append(Finding("report_duplicate_check", risk, "matched", current.title_summary, f"{other.employee_name}-{other.report_date}-{other.title_summary}", cand["candidate_score"], reason, details))
         risk = highest_risk(f.risk_level for f in findings)
         summary = "；".join(f.reason for f in findings[:3])
@@ -222,9 +314,12 @@ class DailyReportPipeline:
         max_candidates = max(1, int(self.daily_cfg.get("max_candidates", 20)))
         weights = self.daily_cfg.get("score_weights", {})
         wt_text, wt_sem, wt_rec = float(weights.get("text", 0.45)), float(weights.get("semantic", 0.45)), float(weights.get("recency", 0.10))
-        current_text = normalize_text(current.title_summary, current.work_description)
-        current_hash = stable_hash(current_text)
-        candidates = []
+        current_text = self._normalized_text_by_id.get(current.report_id) or normalize_text(current.title_summary, current.work_description)
+        current_hash = self._text_hash_by_id.get(current.report_id) or stable_hash(current_text)
+        semantic_scores = None
+        if matrix is not None and current.report_id in index_by_id:
+            semantic_scores = cosine_similarity(matrix[index_by_id[current.report_id]], matrix).ravel()
+        eligible = []
         for other in reports:
             if other.report_id == current.report_id or other.status == "withdrawn":
                 continue
@@ -244,14 +339,21 @@ class DailyReportPipeline:
                     continue
                 match_type = "cross_user_repeat"
                 horizon = max(1, cross_days)
-            text = normalize_text(other.title_summary, other.work_description)
-            seq = SequenceMatcher(None, current_text, text).ratio()
-            sem = 0.0
-            if matrix is not None and current.report_id in index_by_id and other.report_id in index_by_id:
-                sem = float(cosine_similarity(matrix[index_by_id[current.report_id]], matrix[index_by_id[other.report_id]])[0, 0])
+            text = self._normalized_text_by_id.get(other.report_id) or normalize_text(other.title_summary, other.work_description)
+            sem = float(semantic_scores[index_by_id[other.report_id]]) if semantic_scores is not None and other.report_id in index_by_id else 0.0
             recency = max(0.0, 1.0 - min(gap, horizon) / horizon)
+            hash_same = current_hash == (self._text_hash_by_id.get(other.report_id) or stable_hash(text))
+            preliminary = sem * wt_sem + recency * wt_rec + (1.0 if hash_same else 0.0)
+            eligible.append((preliminary, other, text, sem, recency, match_type, gap, hash_same))
+
+        # Expensive SequenceMatcher is restricted to the strongest semantic/hash candidates.
+        pool_size = max(20, max_candidates)
+        eligible.sort(key=lambda item: item[0], reverse=True)
+        candidates = []
+        for _, other, text, sem, recency, match_type, gap, hash_same in eligible[:pool_size]:
+            seq = SequenceMatcher(None, current_text, text).ratio()
             score = round(min(1.0, seq * wt_text + sem * wt_sem + recency * wt_rec), 4)
-            candidates.append({"report": other, "candidate_score": score, "text_similarity": round(seq, 4), "semantic_similarity": round(sem, 4), "recency_score": round(recency, 4), "match_type": match_type, "days_gap": gap, "hash_same": current_hash == stable_hash(text)})
+            candidates.append({"report": other, "candidate_score": score, "text_similarity": round(seq, 4), "semantic_similarity": round(sem, 4), "recency_score": round(recency, 4), "match_type": match_type, "days_gap": gap, "hash_same": hash_same})
         candidates.sort(key=lambda x: (x["hash_same"], x["candidate_score"]), reverse=True)
         return candidates[:max_candidates]
 
@@ -388,7 +490,10 @@ class DailyReportPipeline:
                     reason="用户未绑定小组，跳过组长汇总一致性检查",
                 )
             ]
-        snapshot = self.db.find_testcase_snapshot(report.group_id, report.report_date)
+        snapshot_key = (report.group_id, report.report_date)
+        if snapshot_key not in self._snapshot_cache:
+            self._snapshot_cache[snapshot_key] = self.db.find_testcase_snapshot(*snapshot_key)
+        snapshot = self._snapshot_cache[snapshot_key]
         if not snapshot:
             return [
                 Finding(
@@ -481,8 +586,13 @@ class DailyReportPipeline:
         return findings
 
     def _load_testcase_rows(self, stored_path: str) -> dict[str, dict[str, Any]]:
+        cached = self._testcase_rows_cache.get(stored_path)
+        if cached is not None:
+            return cached
         path = self.storage.resolve(stored_path)
-        return load_daily_sheet_rows(path)
+        rows = load_daily_sheet_rows(path)
+        self._testcase_rows_cache[stored_path] = rows
+        return rows
 
     @staticmethod
     def _case_key(row: dict[str, Any]) -> str:
@@ -518,7 +628,7 @@ class DailyReportPipeline:
             summary = "代码 Token 查重未执行：附件中未找到可解析的源代码文件"
             return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "no_source_files", report.title_summary, reason=summary)])
         history_days = int(self.checks.get("code_history_days", 30))
-        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history = [candidate for candidate in (self._task_reports_all or self.db.list_reports(None)) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
         history_with_tokens = [(candidate, *self._code_tokens(candidate)) for candidate in history]
         history_with_tokens = [(candidate, tokens, file_count) for candidate, tokens, file_count in history_with_tokens if tokens]
         if not history_with_tokens:
@@ -551,7 +661,9 @@ class DailyReportPipeline:
             data = self.storage.read(str(artifact.get("stored_path") or ""))
             if name.lower().endswith(".zip"):
                 with zipfile.ZipFile(BytesIO(data)) as archive:
-                    for member in archive.infolist():
+                    members = archive.infolist()
+                    self._validate_zip_members(members)
+                    for member in members:
                         relative = Path(member.filename)
                         if member.is_dir() or relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in source_extensions:
                             continue
@@ -562,6 +674,13 @@ class DailyReportPipeline:
         result = (tokens, len(texts))
         self._code_token_cache[report.report_id] = result
         return result
+
+    @staticmethod
+    def _validate_zip_members(members: list[zipfile.ZipInfo]) -> None:
+        if len(members) > 2_000:
+            raise ValueError("ZIP 文件条目超过 2000 个限制")
+        if sum(max(0, int(member.file_size)) for member in members) > 200 * 1024 * 1024:
+            raise ValueError("ZIP 解压后数据超过 200 MB 限制")
 
     @staticmethod
     def _normalize_code_tokens(source: str) -> list[str]:
@@ -694,7 +813,7 @@ class DailyReportPipeline:
             return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "unavailable", report.title_summary, reason=summary)])
 
         history_days = int(self.checks.get("code_history_days", 30))
-        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history = [candidate for candidate in (self._task_reports_all or self.db.list_reports(None)) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
         history_with_code = [(candidate, self._code_artifacts(candidate)) for candidate in history]
         history_with_code = [(candidate, submission) for candidate, submission in history_with_code if submission]
         if not history_with_code:
@@ -730,7 +849,7 @@ class DailyReportPipeline:
         return CheckResult(checker, True, "success", risk, summary, [finding])
 
     def _code_artifacts(self, report: Report) -> list[dict[str, Any]]:
-        return [artifact for artifact in self.db.list_artifacts_for_report(report.report_id) if artifact.get("artifact_type") == "code"]
+        return [artifact for artifact in self._artifacts(report.report_id) if artifact.get("artifact_type") == "code"]
 
     def _document_token_check(self, report: Report) -> CheckResult:
         checker = "document_check"
@@ -742,7 +861,7 @@ class DailyReportPipeline:
             return CheckResult(checker, True, "success", "normal", "已记录文档条目；未上传可供正文 Token 查重的文档附件")
 
         history_days = int(self.checks.get("document_history_days", 30))
-        history = [candidate for candidate in self.db.list_reports(None) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history = [candidate for candidate in (self._task_reports_all or self.db.list_reports(None)) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
         historical_artifacts = [(candidate, artifact) for candidate in history for artifact in self._document_artifacts(candidate)]
         if not historical_artifacts:
             summary = f"未找到近 {history_days} 天可比对的本人历史文档"
@@ -786,7 +905,12 @@ class DailyReportPipeline:
         return CheckResult(checker, True, "success", risk, summary, [finding])
 
     def _document_artifacts(self, report: Report) -> list[dict[str, Any]]:
-        return [artifact for artifact in self.db.list_artifacts_for_report(report.report_id) if artifact.get("artifact_type") == "document"]
+        return [artifact for artifact in self._artifacts(report.report_id) if artifact.get("artifact_type") == "document"]
+
+    def _artifacts(self, report_id: str) -> list[dict[str, Any]]:
+        if report_id not in self._artifact_cache:
+            self._artifact_cache[report_id] = self.db.list_artifacts_for_report(report_id)
+        return self._artifact_cache[report_id]
 
     def _extract_document_texts(self, artifacts: list[dict[str, Any]]) -> list[str]:
         texts = []
@@ -797,25 +921,39 @@ class DailyReportPipeline:
         return texts
 
     def _extract_document_text(self, artifact: dict[str, Any]) -> str:
+        cache_key = str(artifact.get("artifact_id") or artifact.get("stored_path") or "")
+        if cache_key in self._document_text_cache:
+            return self._document_text_cache[cache_key]
         name = str(artifact.get("original_filename") or "").lower()
         data = self.storage.read(str(artifact.get("stored_path") or ""))
+        max_bytes = int(self.config.get("upload", {}).get("max_file_mb", 50)) * 1024 * 1024
+        if len(data) > max_bytes:
+            raise ValueError(f"文档超过 {max_bytes // 1024 // 1024} MB 限制")
         if name.endswith(".docx"):
             document = Document(BytesIO(data))
             parts = [paragraph.text for paragraph in document.paragraphs]
             parts.extend(cell.text for table in document.tables for row in table.rows for cell in row.cells)
-            return "\n".join(parts)
-        if name.endswith(".pdf"):
+            text = "\n".join(parts)
+        elif name.endswith(".pdf"):
             try:
                 from pypdf import PdfReader
             except ImportError as exc:
                 raise ValueError("缺少 pypdf 依赖，无法读取 PDF") from exc
-            return "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
-        if name.endswith((".txt", ".md")):
-            return data.decode("utf-8", errors="replace")
-        if name.endswith(".xlsx"):
+            pages = PdfReader(BytesIO(data)).pages
+            if len(pages) > 500:
+                raise ValueError("PDF 超过 500 页限制")
+            text = "\n".join(page.extract_text() or "" for page in pages)
+        elif name.endswith((".txt", ".md")):
+            text = data.decode("utf-8", errors="replace")
+        elif name.endswith(".xlsx"):
             workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
-            return "\n".join(str(cell) for sheet in workbook.worksheets for row in sheet.iter_rows(values_only=True) for cell in row if cell not in (None, ""))
-        return ""
+            text = "\n".join(str(cell) for sheet in workbook.worksheets for row in sheet.iter_rows(values_only=True) for cell in row if cell not in (None, ""))
+        else:
+            text = ""
+        if len(text) > 2_000_000:
+            raise ValueError("文档正文超过 200 万字符限制")
+        self._document_text_cache[cache_key] = text
+        return text
 
     @staticmethod
     def _document_token_similarity(current_text: str, history_text: str) -> tuple[float, dict[str, float | int]]:
@@ -877,7 +1015,9 @@ class DailyReportPipeline:
             data = self.storage.read(str(artifact.get("stored_path") or ""))
             if name.lower().endswith(".zip"):
                 with zipfile.ZipFile(BytesIO(data)) as archive:
-                    for member in archive.infolist():
+                    members = archive.infolist()
+                    self._validate_zip_members(members)
+                    for member in members:
                         relative = Path(member.filename)
                         if member.is_dir() or relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in source_extensions:
                             continue

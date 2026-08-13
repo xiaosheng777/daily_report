@@ -40,12 +40,16 @@ class SQLiteBackend(DatabaseBackend):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("pragma busy_timeout=10000")
+        conn.execute("pragma foreign_keys=on")
         return conn
 
     def initialize(self, seed_demo_users: bool = True) -> None:
         with self.connect() as db:
+            db.execute("pragma journal_mode=wal")
+            db.execute("pragma synchronous=normal")
             existing_report_columns = {row[1] for row in db.execute("pragma table_info(reports)").fetchall()}
             backfill_report_roles = bool(existing_report_columns) and "submitter_role" not in existing_report_columns
             db.executescript("""
@@ -96,9 +100,28 @@ class SQLiteBackend(DatabaseBackend):
               trigger_source text not null default 'manual', report_date text default '', attempt_count integer not null default 0,
               payload_json text not null, config_snapshot_json text default '{}', result_json text default '{}',
               result_dir text default '', status text not null, error_message text default '', created_at text not null,
-              finished_at text default ''
+              finished_at text default '', priority integer not null default 0, queued_at text default '',
+              started_at text default '', heartbeat_at text default '', worker_id text default '', lease_token text default '',
+              progress_stage text default '', progress_current integer not null default 0, progress_total integer not null default 0,
+              progress_message text default '', cancel_requested integer not null default 0, failure_type text default '',
+              partial_available integer not null default 0, current_attempt integer not null default 1,
+              summary_json text default '{}'
             );
             create table if not exists task_reports (task_id text not null, report_id text not null, primary key(task_id, report_id));
+            create table if not exists task_case_results (
+              task_id text not null, attempt_no integer not null, report_id text not null,
+              owner_user_id text default '', department_id text default '', group_id text default '', risk_level text default 'normal',
+              result_json text not null, created_at text not null,
+              primary key(task_id, attempt_no, report_id)
+            );
+            create table if not exists task_missing_results (
+              task_id text not null, attempt_no integer not null, row_no integer not null,
+              user_id text default '', department_id text default '', group_id text default '', result_json text not null,
+              primary key(task_id, attempt_no, row_no)
+            );
+            create table if not exists worker_leases (
+              lease_name text primary key, worker_id text not null, lease_token text not null, heartbeat_at text not null
+            );
             create table if not exists task_page_clears (user_id text primary key, cleared_at text not null);
             create table if not exists task_hidden_tasks (user_id text not null, task_id text not null, primary key(user_id, task_id));
             create table if not exists reset_confirmations (confirmation_id text primary key, user_id text not null, expires_at text not null);
@@ -131,6 +154,21 @@ class SQLiteBackend(DatabaseBackend):
                 "alter table check_tasks add column attempt_count integer not null default 0",
                 "alter table check_tasks add column config_snapshot_json text default '{}'",
                 "alter table check_tasks add column result_dir text default ''",
+                "alter table check_tasks add column priority integer not null default 0",
+                "alter table check_tasks add column queued_at text default ''",
+                "alter table check_tasks add column started_at text default ''",
+                "alter table check_tasks add column heartbeat_at text default ''",
+                "alter table check_tasks add column worker_id text default ''",
+                "alter table check_tasks add column lease_token text default ''",
+                "alter table check_tasks add column progress_stage text default ''",
+                "alter table check_tasks add column progress_current integer not null default 0",
+                "alter table check_tasks add column progress_total integer not null default 0",
+                "alter table check_tasks add column progress_message text default ''",
+                "alter table check_tasks add column cancel_requested integer not null default 0",
+                "alter table check_tasks add column failure_type text default ''",
+                "alter table check_tasks add column partial_available integer not null default 0",
+                "alter table check_tasks add column current_attempt integer not null default 1",
+                "alter table check_tasks add column summary_json text default '{}'",
                 "alter table testcase_snapshots add column group_id text default ''",
                 "alter table testcase_snapshots add column group_name text default ''",
             ]:
@@ -139,6 +177,15 @@ class SQLiteBackend(DatabaseBackend):
                 except sqlite3.OperationalError:
                     pass
             db.execute("create unique index if not exists idx_check_tasks_system_daily on check_tasks(trigger_source, task_date) where trigger_source='system_daily'")
+            db.execute("create index if not exists idx_check_tasks_queue on check_tasks(status, priority desc, queued_at)")
+            db.execute("create index if not exists idx_check_tasks_creator_status on check_tasks(created_by, status)")
+            db.execute("create index if not exists idx_reports_date_status on reports(report_date, status)")
+            db.execute("create index if not exists idx_reports_owner_date on reports(owner_user_id, report_date)")
+            db.execute("create index if not exists idx_reports_department_date on reports(department_id, report_date)")
+            db.execute("create index if not exists idx_reports_group_date on reports(group_id, report_date)")
+            db.execute("create index if not exists idx_artifacts_report_type on artifacts(report_id, artifact_type)")
+            db.execute("create index if not exists idx_task_case_scope on task_case_results(task_id, attempt_no, department_id, group_id)")
+            db.execute("update check_tasks set queued_at=created_at where queued_at='' and status='queued'")
             self._migrate_testcase_snapshots_unique(db)
             db.execute("update users set role = ? where role = 'department_manager'", (ROLE_DIRECTOR,))
             db.execute("update users set role = ? where role = 'global_manager'", (ROLE_MINISTER,))
@@ -382,6 +429,19 @@ class SQLiteBackend(DatabaseBackend):
     def list_artifacts_for_report(self, report_id: str) -> list[dict[str, Any]]:
         with self.connect() as db: return [dict(r) for r in db.execute("select * from artifacts where report_id=? order by created_at", (report_id,)).fetchall()]
 
+    def list_artifacts_for_reports(self, report_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        result = {report_id: [] for report_id in report_ids}
+        with self.connect() as db:
+            for offset in range(0, len(report_ids), 500):
+                chunk = report_ids[offset:offset + 500]
+                if not chunk:
+                    continue
+                rows = db.execute(f"select * from artifacts where report_id in ({','.join('?' for _ in chunk)}) order by created_at", chunk).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    result.setdefault(str(item["report_id"]), []).append(item)
+        return result
+
     def get_artifact(self, artifact_id: str, user: User | None = None) -> dict[str, Any] | None:
         with self.connect() as db: row = db.execute("select * from artifacts where artifact_id=?", (artifact_id,)).fetchone()
         if not row: return None
@@ -495,38 +555,131 @@ class SQLiteBackend(DatabaseBackend):
         tid = token("T_", 14); dept = user.department_id if user.role in {ROLE_GROUP_LEADER, ROLE_DIRECTOR} else ""
         task_date = today_iso()
         with self.connect() as db:
+            db.execute("begin immediate")
+            active = db.execute(
+                "select task_id from check_tasks where created_by=? and trigger_source='manual' and status in ('queued','running') order by created_at limit 1",
+                (user.user_id,),
+            ).fetchone()
+            if active:
+                raise ValueError(f"active_task_exists:{active['task_id']}")
             sequence = db.execute("select count(*) from check_tasks where created_by=? and task_date=?", (user.user_id, task_date)).fetchone()[0] + 1
             task_name = f"{int(task_date[5:7])}.{int(task_date[8:10])}查重({sequence})"
-            db.execute("insert into check_tasks(task_id,created_by,department_id,task_name,task_date,payload_json,config_snapshot_json,result_dir,status,created_at) values (?,?,?,?,?,?,?,?, 'running',?)", (tid, user.user_id, dept, task_name, task_date, json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, now_iso()))
+            created = now_iso()
+            db.execute("""insert into check_tasks(
+                task_id,created_by,department_id,task_name,task_date,payload_json,config_snapshot_json,result_dir,
+                status,priority,queued_at,attempt_count,current_attempt,progress_stage,progress_message,created_at)
+                values (?,?,?,?,?,?,?,?,'queued',0,?,1,1,'queued','等待后台 worker 执行',?)""",
+                (tid, user.user_id, dept, task_name, task_date, json.dumps(payload, ensure_ascii=False),
+                 json.dumps(config_snapshot, ensure_ascii=False), result_dir, created, created))
         return tid
 
     def begin_automatic_task(self, report_date: str, payload: dict[str, Any], config_snapshot: dict[str, Any], result_dir: str) -> tuple[str, bool]:
-        """Create or resume the single daily system task.  Returns (task_id, should_run)."""
+        """Create the single queued daily system task. Existing tasks never retry implicitly."""
         task_date = (datetime.strptime(report_date, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
         with self.connect() as db:
-            row = db.execute("select task_id,status,attempt_count from check_tasks where trigger_source='system_daily' and task_date=?", (task_date,)).fetchone()
-            if row and row["status"] == "finished":
-                return row["task_id"], False
-            if row and row["status"] == "failed" and int(row["attempt_count"] or 0) >= 2:
-                return row["task_id"], False
+            db.execute("begin immediate")
+            row = db.execute("select task_id from check_tasks where trigger_source='system_daily' and task_date=?", (task_date,)).fetchone()
             if row:
-                db.execute("""update check_tasks set status='running', attempt_count=attempt_count+1, payload_json=?, config_snapshot_json=?, result_dir=?,
-                           result_json='{}', error_message='', finished_at='' where task_id=?""",
-                           (json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, row["task_id"]))
-                return row["task_id"], True
+                return row["task_id"], False
             tid = token("T_", 14)
             task_name = (
                 f"{int(report_date[5:7])}.{int(report_date[8:10])} 日报自动查重"
                 f"（{int(task_date[5:7])}.{int(task_date[8:10])} 执行）"
             )
-            db.execute("""insert into check_tasks(task_id,created_by,department_id,task_name,task_date,trigger_source,report_date,attempt_count,
-                           payload_json,config_snapshot_json,result_dir,status,created_at)
-                           values (?,'','',?,?,'system_daily',?,1,?,?,?,'running',?)""",
-                       (tid, task_name, task_date, report_date, json.dumps(payload, ensure_ascii=False), json.dumps(config_snapshot, ensure_ascii=False), result_dir, now_iso()))
+            created = now_iso()
+            db.execute("""insert into check_tasks(task_id,created_by,department_id,task_name,task_date,trigger_source,report_date,
+                           attempt_count,current_attempt,payload_json,config_snapshot_json,result_dir,status,priority,queued_at,
+                           progress_stage,progress_message,created_at)
+                           values (?,'','',?,?,'system_daily',?,1,1,?,?,?,'queued',100,?,'queued','等待后台 worker 执行',?)""",
+                       (tid, task_name, task_date, report_date, json.dumps(payload, ensure_ascii=False),
+                        json.dumps(config_snapshot, ensure_ascii=False), result_dir, created, created))
         return tid, True
 
-    def finish_task(self, task_id: str, status: str, result: dict[str, Any], error: str = "") -> None:
-        with self.connect() as db: db.execute("update check_tasks set status=?,result_json=?,error_message=?,finished_at=? where task_id=?", (status, json.dumps(result, ensure_ascii=False), error, now_iso(), task_id))
+    def acquire_worker_lease(self, worker_id: str, lease_token: str, stale_before: str) -> bool:
+        with self.connect() as db:
+            db.execute("begin immediate")
+            row = db.execute("select * from worker_leases where lease_name='duplicate-worker'").fetchone()
+            if row and row["heartbeat_at"] >= stale_before and row["lease_token"] != lease_token:
+                return False
+            db.execute("insert or replace into worker_leases(lease_name,worker_id,lease_token,heartbeat_at) values ('duplicate-worker',?,?,?)", (worker_id, lease_token, now_iso()))
+        return True
+
+    def heartbeat_worker(self, worker_id: str, lease_token: str) -> bool:
+        with self.connect() as db:
+            changed = db.execute("update worker_leases set heartbeat_at=? where lease_name='duplicate-worker' and worker_id=? and lease_token=?", (now_iso(), worker_id, lease_token)).rowcount
+        return bool(changed)
+
+    def release_worker_lease(self, worker_id: str, lease_token: str) -> None:
+        with self.connect() as db:
+            db.execute("delete from worker_leases where lease_name='duplicate-worker' and worker_id=? and lease_token=?", (worker_id, lease_token))
+
+    def fail_stale_tasks(self, stale_before: str) -> int:
+        message = "后台 worker 心跳中断，任务已停止；可手动重试"
+        with self.connect() as db:
+            return db.execute("""update check_tasks set status='failed',failure_type='interrupted',error_message=?,
+                progress_message=?,finished_at=?,worker_id='',lease_token='',partial_available=case when progress_current>0 then 1 else partial_available end
+                where status='running' and coalesce(heartbeat_at,'')<?""", (message, message, now_iso(), stale_before)).rowcount
+
+    def claim_next_task(self, worker_id: str, lease_token: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            db.execute("begin immediate")
+            row = db.execute("select task_id from check_tasks where status='queued' order by priority desc,queued_at,created_at limit 1").fetchone()
+            if not row:
+                return None
+            started = now_iso()
+            changed = db.execute("""update check_tasks set status='running',started_at=?,heartbeat_at=?,worker_id=?,lease_token=?,
+                progress_stage='starting',progress_current=0,progress_total=0,progress_message='正在启动查重任务',cancel_requested=0,
+                failure_type='',error_message='',finished_at='' where task_id=? and status='queued'""",
+                (started, started, worker_id, lease_token, row["task_id"])).rowcount
+            if not changed:
+                return None
+            task = db.execute("select * from check_tasks where task_id=?", (row["task_id"],)).fetchone()
+        return self._decode_task(task, include_results=False) if task else None
+
+    def heartbeat_task(self, task_id: str, lease_token: str) -> bool:
+        with self.connect() as db:
+            changed = db.execute("update check_tasks set heartbeat_at=? where task_id=? and status='running' and lease_token=?", (now_iso(), task_id, lease_token)).rowcount
+        return bool(changed)
+
+    def update_task_progress(self, task_id: str, attempt_no: int, stage: str, current: int, total: int, message: str = "") -> bool:
+        with self.connect() as db:
+            changed = db.execute("""update check_tasks set progress_stage=?,progress_current=?,progress_total=?,progress_message=?,heartbeat_at=?
+                where task_id=? and current_attempt=? and status='running'""", (stage, int(current), int(total), message, now_iso(), task_id, int(attempt_no))).rowcount
+        return bool(changed)
+
+    def task_cancel_requested(self, task_id: str, attempt_no: int) -> bool:
+        with self.connect() as db:
+            row = db.execute("select cancel_requested from check_tasks where task_id=? and current_attempt=?", (task_id, int(attempt_no))).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def save_task_case(self, task_id: str, attempt_no: int, case: dict[str, Any]) -> None:
+        with self.connect() as db:
+            db.execute("""insert or replace into task_case_results(task_id,attempt_no,report_id,owner_user_id,department_id,group_id,risk_level,result_json,created_at)
+                values (?,?,?,?,?,?,?,?,?)""", (task_id, int(attempt_no), str(case.get("report_id") or ""), str(case.get("owner_user_id") or ""),
+                str(case.get("department_id") or ""), str(case.get("group_id") or ""), str(case.get("overall_risk") or "normal"),
+                json.dumps(case, ensure_ascii=False), now_iso()))
+            db.execute("update check_tasks set partial_available=1 where task_id=?", (task_id,))
+
+    def save_task_missing_results(self, task_id: str, attempt_no: int, rows: list[dict[str, Any]]) -> None:
+        with self.connect() as db:
+            db.execute("delete from task_missing_results where task_id=? and attempt_no=?", (task_id, int(attempt_no)))
+            for index, row in enumerate(rows):
+                db.execute("""insert into task_missing_results(task_id,attempt_no,row_no,user_id,department_id,group_id,result_json)
+                    values (?,?,?,?,?,?,?)""", (task_id, int(attempt_no), index, str(row.get("user_id") or ""),
+                    str(row.get("department_id") or ""), str(row.get("group_id") or ""), json.dumps(row, ensure_ascii=False)))
+            if rows:
+                db.execute("update check_tasks set partial_available=1 where task_id=?", (task_id,))
+
+    def finish_task(self, task_id: str, status: str, result: dict[str, Any], error: str = "", failure_type: str = "") -> None:
+        summary = result.get("summary", {}) if isinstance(result, dict) else {}
+        with self.connect() as db:
+            has_incremental = db.execute("select 1 from task_case_results where task_id=? limit 1", (task_id,)).fetchone()
+            stored_result = {"summary": summary} if has_incremental else result
+            db.execute("""update check_tasks set status=?,result_json=?,summary_json=?,error_message=?,failure_type=?,finished_at=?,
+                heartbeat_at=?,progress_stage=?,progress_message=?,worker_id='',lease_token='',
+                partial_available=case when progress_current>0 then 1 else partial_available end
+                where task_id=?""", (status, json.dumps(stored_result, ensure_ascii=False), json.dumps(summary, ensure_ascii=False),
+                error, failure_type, now_iso(), now_iso(), status, error or ("查重完成" if status == "finished" else status), task_id))
 
     def list_tasks(self, user: User, filters: dict[str, Any] | None = None, include_hidden: bool = True) -> list[dict[str, Any]]:
         filters = filters or {}
@@ -539,10 +692,14 @@ class SQLiteBackend(DatabaseBackend):
                 if key in {"start", "end"}: where.append(column + " ?")
                 else: where.append(column + "=?")
                 values.append(value)
-        with self.connect() as db: rows = db.execute("select t.*,coalesce(u.display_name,'系统') creator_name from check_tasks t left join users u on u.user_id=t.created_by where " + " and ".join(where) + " order by t.created_at desc limit 200", values).fetchall()
+        columns = """t.task_id,t.created_by,t.department_id,t.task_name,t.task_date,t.trigger_source,t.report_date,t.result_dir,
+            t.status,t.error_message,t.failure_type,t.created_at,t.queued_at,t.started_at,t.finished_at,t.heartbeat_at,
+            t.progress_stage,t.progress_current,t.progress_total,t.progress_message,t.cancel_requested,t.partial_available,
+            t.attempt_count,t.current_attempt,t.summary_json,t.payload_json,coalesce(u.display_name,'系统') creator_name"""
+        with self.connect() as db: rows = db.execute("select " + columns + " from check_tasks t left join users u on u.user_id=t.created_by where " + " and ".join(where) + " order by t.created_at desc limit 200", values).fetchall()
         out = []
         for row in rows:
-            d = dict(row); result = json.loads(d.pop("result_json", "{}") or "{}"); d["payload"] = json.loads(d.pop("payload_json", "{}") or "{}"); d["summary"] = result.get("summary", {}); out.append(d)
+            d = dict(row); d["payload"] = json.loads(d.pop("payload_json", "{}") or "{}"); d["summary"] = json.loads(d.pop("summary_json", "{}") or "{}"); out.append(d)
         return out
 
     def get_task(self, task_id: str, user: User | None = None) -> dict[str, Any] | None:
@@ -550,7 +707,98 @@ class SQLiteBackend(DatabaseBackend):
         if user: where.append("(created_by=? or trigger_source='system_daily')"); values.append(user.user_id)
         with self.connect() as db: row = db.execute("select * from check_tasks where " + " and ".join(where), values).fetchone()
         if not row: return None
-        d = dict(row); d["payload"] = json.loads(d.get("payload_json") or "{}"); d["config_snapshot"] = json.loads(d.get("config_snapshot_json") or "{}"); d["result"] = json.loads(d.get("result_json") or "{}"); return d
+        return self._decode_task(row, include_results=True)
+
+    def get_task_status(self, task_id: str, user: User | None = None) -> dict[str, Any] | None:
+        task = self.get_task(task_id, user)
+        if not task:
+            return None
+        task.pop("result", None); task.pop("config_snapshot", None)
+        current, total = int(task.get("progress_current") or 0), int(task.get("progress_total") or 0)
+        task["progress_percent"] = round(current * 100 / total, 1) if total else 0.0
+        started = str(task.get("started_at") or "")
+        ended = str(task.get("finished_at") or now_iso())
+        try:
+            task["elapsed_seconds"] = max(0, int((datetime.fromisoformat(ended) - datetime.fromisoformat(started)).total_seconds())) if started else 0
+        except ValueError:
+            task["elapsed_seconds"] = 0
+        return task
+
+    def get_task_summary_for_user(self, task_id: str, attempt_no: int, user: User) -> dict[str, int]:
+        if user.role in {ROLE_MINISTER, ROLE_ADMIN}:
+            case_scope, case_values = "1=1", []
+            missing_scope, missing_values = "1=1", []
+        elif user.role == ROLE_DIRECTOR:
+            case_scope, case_values = "department_id=?", [user.department_id]
+            missing_scope, missing_values = "department_id=?", [user.department_id]
+        elif user.role == ROLE_GROUP_LEADER:
+            case_scope, case_values = "(owner_user_id=? or group_id=?)", [user.user_id, user.group_id]
+            missing_scope, missing_values = "(user_id=? or group_id=?)", [user.user_id, user.group_id]
+        else:
+            return {"report_count": 0, "high_risk_count": 0, "medium_risk_count": 0, "missing_report_count": 0}
+        with self.connect() as db:
+            case = db.execute(f"""select count(*) report_count,
+                sum(case when risk_level='high' then 1 else 0 end) high_count,
+                sum(case when risk_level='medium' then 1 else 0 end) medium_count
+                from task_case_results where task_id=? and attempt_no=? and {case_scope}""",
+                [task_id, int(attempt_no), *case_values]).fetchone()
+            missing = db.execute(f"select count(*) from task_missing_results where task_id=? and attempt_no=? and {missing_scope}",
+                [task_id, int(attempt_no), *missing_values]).fetchone()[0]
+        return {"report_count": int(case["report_count"] or 0), "high_risk_count": int(case["high_count"] or 0),
+                "medium_risk_count": int(case["medium_count"] or 0), "missing_report_count": int(missing or 0)}
+
+    def retry_task(self, task_id: str, user: User) -> bool:
+        with self.connect() as db:
+            db.execute("begin immediate")
+            task = db.execute("select * from check_tasks where task_id=?", (task_id,)).fetchone()
+            if not task or (task["trigger_source"] != "system_daily" and task["created_by"] != user.user_id):
+                raise ValueError("task not found or forbidden")
+            if task["status"] not in {"failed", "cancelled"}:
+                return False
+            attempt = int(task["current_attempt"] or 1) + 1
+            changed = db.execute("""update check_tasks set status='queued',priority=case when trigger_source='system_daily' then 100 else 0 end,
+                queued_at=?,started_at='',heartbeat_at='',worker_id='',lease_token='',progress_stage='queued',progress_current=0,
+                progress_total=0,progress_message='等待后台 worker 重试',cancel_requested=0,failure_type='',error_message='',finished_at='',
+                result_json='{}',summary_json='{}',partial_available=0,current_attempt=?,attempt_count=?
+                where task_id=? and status in ('failed','cancelled')""", (now_iso(), attempt, attempt, task_id)).rowcount
+        return bool(changed)
+
+    def cancel_task(self, task_id: str, user: User) -> str:
+        with self.connect() as db:
+            db.execute("begin immediate")
+            task = db.execute("select * from check_tasks where task_id=?", (task_id,)).fetchone()
+            if not task or (task["trigger_source"] != "system_daily" and task["created_by"] != user.user_id):
+                raise ValueError("task not found or forbidden")
+            if task["status"] == "queued":
+                db.execute("update check_tasks set status='cancelled',failure_type='cancelled',progress_stage='cancelled',progress_message='任务已取消',finished_at=? where task_id=? and status='queued'", (now_iso(), task_id))
+                return "cancelled"
+            if task["status"] == "running":
+                db.execute("update check_tasks set cancel_requested=1,progress_message='正在取消任务' where task_id=? and status='running'", (task_id,))
+                return "cancelling"
+            return str(task["status"])
+
+    def get_user_by_id(self, user_id: str) -> User | None:
+        if not user_id:
+            return None
+        with self.connect() as db:
+            row = db.execute(self._user_select() + " where u.user_id=?", (user_id,)).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def _decode_task(self, row: sqlite3.Row, include_results: bool) -> dict[str, Any]:
+        d = dict(row)
+        d["payload"] = json.loads(d.get("payload_json") or "{}")
+        d["config_snapshot"] = json.loads(d.get("config_snapshot_json") or "{}")
+        d["summary"] = json.loads(d.get("summary_json") or "{}")
+        if include_results:
+            attempt = int(d.get("current_attempt") or 1)
+            with self.connect() as db:
+                case_rows = db.execute("select result_json from task_case_results where task_id=? and attempt_no=? order by created_at,report_id", (d["task_id"], attempt)).fetchall()
+                missing_rows = db.execute("select result_json from task_missing_results where task_id=? and attempt_no=? order by row_no", (d["task_id"], attempt)).fetchall()
+            if case_rows or missing_rows:
+                d["result"] = {"summary": d["summary"], "report_cases": [json.loads(item["result_json"]) for item in case_rows], "missing_reports": [json.loads(item["result_json"]) for item in missing_rows]}
+            else:
+                d["result"] = json.loads(d.get("result_json") or "{}")
+        return d
 
     def clear_task_page_display(self, user: User) -> None:
         with self.connect() as db:
@@ -560,8 +808,11 @@ class SQLiteBackend(DatabaseBackend):
         task = self.get_task(task_id, user)
         if not task: raise ValueError("task not found or forbidden")
         if task.get("trigger_source") == "system_daily": raise ValueError("系统自动任务不能删除")
+        if task.get("status") in {"queued", "running"}: raise ValueError("排队或运行中的查重任务不能删除")
         with self.connect() as db:
             db.execute("delete from task_reports where task_id=?", (task_id,))
+            db.execute("delete from task_case_results where task_id=?", (task_id,))
+            db.execute("delete from task_missing_results where task_id=?", (task_id,))
             db.execute("delete from task_hidden_tasks where task_id=?", (task_id,))
             db.execute("delete from check_tasks where task_id=?", (task_id,))
 
@@ -577,9 +828,11 @@ class SQLiteBackend(DatabaseBackend):
         return bool(row)
 
     def clear_business_data(self) -> dict[str, int]:
-        tables = ("task_reports", "task_page_clears", "task_hidden_tasks", "check_tasks", "exports", "artifacts", "reports", "testcase_snapshots", "sessions", "reset_confirmations")
+        tables = ("task_case_results", "task_missing_results", "task_reports", "task_page_clears", "task_hidden_tasks", "check_tasks", "exports", "artifacts", "reports", "testcase_snapshots", "sessions", "reset_confirmations")
         counts: dict[str, int] = {}
         with self.connect() as db:
+            if db.execute("select 1 from check_tasks where status in ('queued','running') limit 1").fetchone():
+                raise ValueError("存在排队或运行中的查重任务，不能清空业务数据")
             for table in tables:
                 counts[table] = int(db.execute(f"select count(*) from {table}").fetchone()[0]); db.execute(f"delete from {table}")
         return counts

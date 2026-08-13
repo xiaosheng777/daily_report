@@ -1,0 +1,17 @@
+{
+  "task_id": "T_bucE-Ldt5LnipA",
+  "generated_at": "2026-08-10T12:00:14",
+  "summary": {
+    "report_count": 0,
+    "high_risk_count": 0,
+    "medium_risk_count": 0,
+    "unknown_risk_count": 0,
+    "triggered_duplicate_checks": 0,
+    "triggered_testcase_checks": 0,
+    "triggered_code_checks": 0,
+    "triggered_document_checks": 0,
+    "missing_report_count": 0
+  },
+  "report_cases": [],
+  "missing_reports": []
+}

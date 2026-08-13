@@ -6,6 +6,21 @@ app:
   seed_demo_users: true  # 仅在空库时创建 admin / admin123 管理员
   frontend_dir: ../frontend
 
+daily_report_submission:
+  enabled: true
+  rollover_time: "09:00"
+
+automatic_daily_duplicate:
+  enabled: true
+  run_at: "12:00"
+  catch_up_on_start: true
+
+task_runner:
+  task_timeout_seconds: 3600
+  stale_heartbeat_seconds: 90
+  shutdown_grace_seconds: 30
+  poll_interval_seconds: 2
+
 storage:
   root_dir: ../storage
   submitted_reports_dir: submitted_reports
@@ -38,12 +53,15 @@ llm_judge:
   api_key_env: DAILY_REPORT_LLM_API_KEY
   model: internal-model-name
   temperature: 0
-  timeout_seconds: 180
+  timeout_seconds: 90
   max_tokens: 1024
-  max_retries: 2
+  max_retries: 1
+  max_reports_per_task: 60
+  task_cutoff_seconds: 2700
   raw_log_path: ../storage/llm_raw_logs.jsonl
 
 daily_duplicate:
+  worker_count: 1
   self_history_days: 30
   cross_user_days: 3
   cross_user_scope: department

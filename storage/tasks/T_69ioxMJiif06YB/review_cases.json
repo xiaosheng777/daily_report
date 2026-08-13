@@ -1,0 +1,301 @@
+{
+  "task_id": "T_69ioxMJiif06YB",
+  "generated_at": "2026-08-10T13:40:35",
+  "summary": {
+    "report_count": 2,
+    "high_risk_count": 1,
+    "medium_risk_count": 1,
+    "unknown_risk_count": 0,
+    "triggered_duplicate_checks": 2,
+    "triggered_testcase_checks": 0,
+    "triggered_code_checks": 2,
+    "triggered_document_checks": 2,
+    "missing_report_count": 4
+  },
+  "report_cases": [
+    {
+      "report_id": "R_9fb299fc20a2525b",
+      "employee_name": "员工1",
+      "owner_user_id": "U_pjX0zi7-xQHt77",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部",
+      "report_date": "2026-08-10",
+      "submitted_at": "2026-08-10T10:16:32",
+      "title_summary": "111111",
+      "overall_risk": "medium",
+      "triggered_checks": [
+        "quality_check",
+        "report_duplicate_check",
+        "code_check",
+        "document_check"
+      ],
+      "checks": [
+        {
+          "checker_id": "quality_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "medium",
+          "summary": "日报质量需关注：工作描述过短",
+          "findings": [
+            {
+              "checker_id": "quality_check",
+              "risk_level": "medium",
+              "status": "quality",
+              "target_name": "111111",
+              "matched_target_name": "",
+              "score": 0.0,
+              "reason": "工作描述过短",
+              "details": {}
+            }
+          ]
+        },
+        {
+          "checker_id": "report_duplicate_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "normal",
+          "summary": "未找到足够相似的历史日报",
+          "findings": []
+        },
+        {
+          "checker_id": "testcase_check",
+          "triggered": false,
+          "status": "skipped",
+          "risk_level": "normal",
+          "summary": "未上传测试用例 Excel",
+          "findings": []
+        },
+        {
+          "checker_id": "code_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "normal",
+          "summary": "未找到近 30 天可比对的本人历史代码",
+          "findings": [
+            {
+              "checker_id": "code_check",
+              "risk_level": "normal",
+              "status": "no_history",
+              "target_name": "111111",
+              "matched_target_name": "",
+              "score": 0.0,
+              "reason": "未找到近 30 天可比对的本人历史代码",
+              "details": {}
+            }
+          ]
+        },
+        {
+          "checker_id": "document_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "normal",
+          "summary": "未找到近 30 天可比对的本人历史文档",
+          "findings": [
+            {
+              "checker_id": "document_check",
+              "risk_level": "normal",
+              "status": "no_history",
+              "target_name": "111111",
+              "matched_target_name": "",
+              "score": 0.0,
+              "reason": "未找到近 30 天可比对的本人历史文档",
+              "details": {}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "report_id": "R_326cbf6b14aa96ac",
+      "employee_name": "员工1",
+      "owner_user_id": "U_pjX0zi7-xQHt77",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部",
+      "report_date": "2026-08-11",
+      "submitted_at": "2026-08-11T10:17:13",
+      "title_summary": "1111111111",
+      "overall_risk": "high",
+      "triggered_checks": [
+        "report_duplicate_check",
+        "code_check",
+        "document_check"
+      ],
+      "checks": [
+        {
+          "checker_id": "quality_check",
+          "triggered": false,
+          "status": "success",
+          "risk_level": "normal",
+          "summary": "日报信息量正常",
+          "findings": []
+        },
+        {
+          "checker_id": "report_duplicate_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "high",
+          "summary": "与昨日日报内容高度相似，工作描述完全相同，无实质新进展，判定为重复提交。",
+          "findings": [
+            {
+              "checker_id": "report_duplicate_check",
+              "risk_level": "high",
+              "status": "matched",
+              "target_name": "1111111111",
+              "matched_target_name": "员工1-2026-08-10-111111",
+              "score": 0.9128,
+              "reason": "与昨日日报内容高度相似，工作描述完全相同，无实质新进展，判定为重复提交。",
+              "details": {
+                "matched_report_id": "R_9fb299fc20a2525b",
+                "matched_report_date": "2026-08-10",
+                "matched_owner_user_id": "U_pjX0zi7-xQHt77",
+                "match_type": "self_repeat",
+                "days_gap": 1,
+                "candidate_score": 0.9128,
+                "text_similarity": 0.8293,
+                "semantic_similarity": 0.9929,
+                "recency_score": 0.9286,
+                "hash_same": false,
+                "llm_called": true,
+                "llm_confidence": 0.95,
+                "llm_raw": {
+                  "duplicate_risk": "high",
+                  "judgement_status": "duplicate",
+                  "confidence": 0.95,
+                  "decision_summary": "与昨日日报内容高度相似，工作描述完全相同，无实质新进展，判定为重复提交。",
+                  "need_human_review": false
+                }
+              }
+            }
+          ]
+        },
+        {
+          "checker_id": "testcase_check",
+          "triggered": false,
+          "status": "skipped",
+          "risk_level": "normal",
+          "summary": "未上传测试用例 Excel",
+          "findings": []
+        },
+        {
+          "checker_id": "code_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "high",
+          "summary": "代码 Token 查重完成，最高相似度 100.0%（本人近 30 天历史代码）",
+          "findings": [
+            {
+              "checker_id": "code_check",
+              "risk_level": "high",
+              "status": "code_token_similarity",
+              "target_name": "1111111111",
+              "matched_target_name": "2026-08-10 · 111111",
+              "score": 1.0,
+              "reason": "代码 Token 查重完成，最高相似度 100.0%（本人近 30 天历史代码）",
+              "details": {
+                "current_source_file_count": 1,
+                "history_source_file_count": 1,
+                "scope": "self_history_only",
+                "engine": "code_token_similarity",
+                "tokenizer": "normalized_code_5gram",
+                "matches": [
+                  {
+                    "source_name": "当前代码附件：app.js",
+                    "matched_name": "2026-08-10 · 111111",
+                    "similarity": 1.0,
+                    "history_source_file_count": 1,
+                    "current_token_count": 932,
+                    "matched_token_count": 297,
+                    "token_overlap": 1.0,
+                    "sequence_similarity": 1.0
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "checker_id": "document_check",
+          "triggered": true,
+          "status": "success",
+          "risk_level": "high",
+          "summary": "文档 Token 查重完成，最高相似度 100.0%（本人近 30 天历史文档）",
+          "findings": [
+            {
+              "checker_id": "document_check",
+              "risk_level": "high",
+              "status": "token_similarity",
+              "target_name": "1111111111",
+              "matched_target_name": "2026-08-10 · 111111 · test.docx",
+              "score": 1.0,
+              "reason": "文档 Token 查重完成，最高相似度 100.0%（本人近 30 天历史文档）",
+              "details": {
+                "current_document_count": 1,
+                "history_document_count": 1,
+                "scope": "self_history_only",
+                "engine": "token_similarity",
+                "tokenizer": "han_character_and_word",
+                "matches": [
+                  {
+                    "source_name": "test.docx",
+                    "matched_name": "2026-08-10 · 111111 · test.docx",
+                    "similarity": 1.0,
+                    "current_token_count": 83,
+                    "matched_token_count": 74,
+                    "token_overlap": 1.0,
+                    "sequence_similarity": 1.0
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "missing_reports": [
+    {
+      "report_date": "2026-08-10",
+      "user_id": "U_UzIQKiByC91MuH",
+      "employee_name": "员工2",
+      "role": "employee",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部"
+    },
+    {
+      "report_date": "2026-08-11",
+      "user_id": "U_UzIQKiByC91MuH",
+      "employee_name": "员工2",
+      "role": "employee",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部"
+    },
+    {
+      "report_date": "2026-08-10",
+      "user_id": "U_gM3fp0sN8XAccR",
+      "employee_name": "组长1",
+      "role": "group_leader",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部"
+    },
+    {
+      "report_date": "2026-08-11",
+      "user_id": "U_gM3fp0sN8XAccR",
+      "employee_name": "组长1",
+      "role": "group_leader",
+      "department_id": "D_CUG1lp10CzbqyY",
+      "department_name": "研发部",
+      "group_id": "G_DJJ5USykou38vQ",
+      "group_name": "研发一部"
+    }
+  ]
+}

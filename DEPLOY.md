@@ -165,10 +165,15 @@ daily_report_submission:
 automatic_daily_duplicate:
   enabled: true
   run_at: "12:00" # 对前一自然日的全公司日报执行查重
-  catch_up_on_start: true # 服务恢复后补跑当天缺失或失败的任务一次
+  catch_up_on_start: true # worker 恢复后补建当天从未创建的任务；已失败任务不自动重试
+
+task_runner:
+  task_timeout_seconds: 3600
+  stale_heartbeat_seconds: 90
+  shutdown_grace_seconds: 30
 ```
 
-自动任务随 backend 容器运行，无需额外配置系统 cron。自动结果会按查看者的组织权限过滤；当前部署必须保持单个 backend 实例。若扩展为多实例，请将调度改为单独的单实例 worker，或增加分布式锁。
+自动任务由独立 `daily-report-worker` 容器入队并执行，无需额外配置系统 cron。数据库租约保证同一存储上只有一个 worker 执行重型任务；不要绕过资源限制直接在 backend 容器内运行 worker。
 
 模型配置：
 
@@ -183,10 +188,11 @@ llm_judge:
   api_key_env: DAILY_REPORT_LLM_API_KEY
 ```
 
-Top-N 和阈值配置：
+并行数、Top-N 和阈值配置：
 
 ```yaml
 daily_duplicate:
+  worker_count: 1 # 保留兼容配置；主流程的 CPU 密集检查固定串行，避免拖慢 Web
   llm_candidate_top_n: 3
   llm_candidate_score_threshold: 0.72
   low_info_candidate_score_threshold: 0.82
@@ -229,7 +235,7 @@ curl -s http://你的内网模型IP:端口/v1/chat/completions \
 
 ```bash
 docker network create daily-report-net 2>/dev/null || true
-docker rm -f daily-report-web daily-report-backend 2>/dev/null || true
+docker rm -f daily-report-web daily-report-worker daily-report-backend 2>/dev/null || true
 
 docker run -d \
   --name daily-report-backend \
@@ -239,6 +245,17 @@ docker run -d \
   -v /opt/daily_report/config/llm_api_key:/app/backend/config/llm_api_key:ro \
   -v /opt/daily_report/storage:/app/storage \
   daily-report-backend:latest
+
+docker run -d \
+  --name daily-report-worker \
+  --restart always \
+  --network daily-report-net \
+  --cpus 2 \
+  --memory 2g \
+  -v /opt/daily_report/config/config.yaml:/app/backend/config/config.yaml:ro \
+  -v /opt/daily_report/config/llm_api_key:/app/backend/config/llm_api_key:ro \
+  -v /opt/daily_report/storage:/app/storage \
+  daily-report-backend:latest python -m src.worker --config config/config.yaml
 
 docker run -d \
   --name daily-report-web \
@@ -275,7 +292,7 @@ bash deploy/scripts/load_and_run_offline.sh /opt/daily_report daily-report-backe
 改完：
 
 ```bash
-docker restart daily-report-backend
+docker restart daily-report-backend daily-report-worker
 ```
 
 ### 改 API key
@@ -283,10 +300,10 @@ docker restart daily-report-backend
 ```bash
 printf '%s' '新key' | sudo tee /opt/daily_report/config/llm_api_key >/dev/null
 sudo chmod 600 /opt/daily_report/config/llm_api_key
-docker restart daily-report-backend
+docker restart daily-report-backend daily-report-worker
 ```
 
-### 改 Top-N/阈值/权重
+### 改并行数/Top-N/阈值/权重
 
 推荐登录 `admin / admin123`，进入“系统管理 → 参数配置”修改。
 
@@ -314,19 +331,20 @@ docker restart daily-report-backend
 
 ```bash
 docker logs -f daily-report-backend
+docker logs -f daily-report-worker
 docker logs -f daily-report-web
 ```
 
 重启：
 
 ```bash
-docker restart daily-report-backend daily-report-web
+docker restart daily-report-backend daily-report-worker daily-report-web
 ```
 
 停止：
 
 ```bash
-docker stop daily-report-backend daily-report-web
+docker stop daily-report-backend daily-report-worker daily-report-web
 ```
 
 备份：

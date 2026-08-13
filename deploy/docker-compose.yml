@@ -10,6 +10,20 @@ services:
     expose:
       - "8000"
 
+  daily-report-worker:
+    image: daily-report-backend:latest
+    container_name: daily-report-worker
+    restart: always
+    depends_on:
+      - daily-report-backend
+    command: ["python", "-m", "src.worker", "--config", "config/config.yaml"]
+    cpus: 2.0
+    mem_limit: 2g
+    volumes:
+      - ../config/config.yaml:/app/backend/config/config.yaml:ro
+      - ../config/llm_api_key:/app/backend/config/llm_api_key:ro
+      - ../storage:/app/storage
+
   daily-report-web:
     image: nginx:alpine
     container_name: daily-report-web

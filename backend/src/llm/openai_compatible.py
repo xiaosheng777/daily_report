@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +13,9 @@ from src.utils.config import env_or_value
 from src.utils.dates import now_iso
 
 
+_RAW_LOG_LOCK = threading.Lock()
+
+
 class OpenAICompatibleJudge(LLMJudge):
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -20,8 +24,8 @@ class OpenAICompatibleJudge(LLMJudge):
         self.api_key = self._load_api_key(config)
         self.model = str(config.get("model") or "")
         self.temperature = float(config.get("temperature", 0))
-        self.timeout_seconds = int(config.get("timeout_seconds", 180))
-        self.max_retries = int(config.get("max_retries", 2))
+        self.timeout_seconds = min(90, max(1, int(config.get("timeout_seconds", 90))))
+        self.max_retries = min(1, max(0, int(config.get("max_retries", 1))))
         self.max_tokens = int(config.get("max_tokens", 1024))
         raw_log_path = str(config.get("raw_log_path") or "").strip()
         self.raw_log_path = Path(raw_log_path) if raw_log_path else None
@@ -44,9 +48,17 @@ class OpenAICompatibleJudge(LLMJudge):
             except Exception as exc:
                 last_error = str(exc)
                 self._log(current, matched, attempt + 1, content, False, last_error)
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and self._retryable(exc):
                     time.sleep(min(2 ** attempt, 4))
+                else:
+                    break
         return LLMJudgeResult(True, False, error=last_error or "llm call failed")
+
+    @staticmethod
+    def _retryable(exc: Exception) -> bool:
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code == 429 or 500 <= exc.code <= 599
+        return isinstance(exc, (urllib.error.URLError, ConnectionError))
 
     def health_check(self) -> dict[str, Any]:
         if not self.base_url:
@@ -144,7 +156,8 @@ class OpenAICompatibleJudge(LLMJudge):
     def _log(self, current: dict[str, Any], matched: dict[str, Any], attempt: int, content: str, ok: bool, error: str) -> None:
         if not self.raw_log_path:
             return
-        self.raw_log_path.parent.mkdir(parents=True, exist_ok=True)
         record = {"logged_at": now_iso(), "model": self.model, "attempt": attempt, "ok": ok, "error": error, "current_report_id": current.get("report_id"), "matched_report_id": matched.get("report_id"), "raw_content": content}
-        with self.raw_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with _RAW_LOG_LOCK:
+            self.raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.raw_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")

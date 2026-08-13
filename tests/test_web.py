@@ -99,6 +99,15 @@ def test_report_rollover_time_uses_the_saved_admin_setting():
         handler._validate_settings_payload({"daily_report_submission.rollover_time": "9点"})
 
 
+def test_daily_duplicate_worker_count_is_exposed_and_validated():
+    assert flatten_settings({"daily_duplicate": {}})["daily_duplicate.worker_count"] == 1
+    DailyReportHandler._validate_settings_payload({"daily_duplicate.worker_count": 1})
+    DailyReportHandler._validate_settings_payload({"daily_duplicate.worker_count": 8})
+    for invalid in (0, 9, 2.5, "three"):
+        with pytest.raises(ValueError, match="1 至 8"):
+            DailyReportHandler._validate_settings_payload({"daily_duplicate.worker_count": invalid})
+
+
 def test_report_docx_marks_grouping_and_actual_submission_time():
     body = build_report_docx({"name": "张三", "department": "研发部", "report_date": "2026-07-30", "submitted_at": "2026-07-31T08:59:59", "manager": "组长", "title_summary": "标题", "work_description": "内容"})
     text = "\n".join(paragraph.text for paragraph in Document(BytesIO(body)).paragraphs)

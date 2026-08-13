@@ -14,7 +14,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from src.core.docx_io import build_report_docx
-from src.core.automation import DailyDuplicateScheduler
 from src.core.pipeline import DailyReportPipeline
 from src.core.schemas import Report
 from src.db.factory import create_database
@@ -37,6 +36,10 @@ REQUIRED_REPORT_FIELDS = ("title_summary", "work_description")
 RESET_CONFIRMATION_PHRASE = "清除全部业务数据"
 
 
+class RequestTooLarge(ValueError):
+    pass
+
+
 def attachment_header(download_name: str) -> str:
     safe_name = Path(download_name).name.replace('"', "")
     ascii_name = safe_name.encode("ascii", "ignore").decode("ascii") or "download"
@@ -52,6 +55,7 @@ def flatten_settings(config: dict) -> dict:
     tc = config.get("testcase_verification", {})
     return {
         "daily_report_submission.rollover_time": str(submission.get("rollover_time", submission.get("cutoff_time", "09:00"))),
+        "daily_duplicate.worker_count": int(dd.get("worker_count", 1)),
         "daily_duplicate.llm_candidate_top_n": int(dd.get("llm_candidate_top_n", 3)),
         "daily_duplicate.llm_candidate_score_threshold": float(dd.get("llm_candidate_score_threshold", 0.72)),
         "daily_duplicate.low_info_candidate_score_threshold": float(dd.get("low_info_candidate_score_threshold", 0.82)),
@@ -201,6 +205,12 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                     include_hidden = (query.get("include_hidden") or ["0"])[0] == "1"
                     tasks = self.db.list_tasks(user, {"status": (query.get("status") or [""])[0], "start": (query.get("start") or [""])[0], "end": (query.get("end") or [""])[0]}, include_hidden=include_hidden)
                     self._send_json([self._task_for_view(task, user) for task in tasks])
+            elif path.startswith("/api/tasks/") and path.endswith("/status"):
+                user = self._require_manager(); tid = path.split("/")[3]
+                if user:
+                    task = self.db.get_task_status(tid, user)
+                    if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
+                    self._send_json(self._task_for_view(task, user))
             elif path.startswith("/api/tasks/") and path.endswith("/results"):
                 user = self._require_manager(); tid = path.split("/")[3]
                 if user:
@@ -349,19 +359,29 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                         raise ValueError("开始日期不能晚于结束日期")
                     cfg = apply_flat_settings(self.config, self.db.get_settings(flatten_settings(self.config)))
                     rel_dir = f"tasks/pending_{token('', 8)}"
-                    result_dir = str(Path(cfg["storage"]["root_dir"]) / rel_dir)
                     task_id = self.db.create_task(user, payload, cfg, rel_dir)
-                    try:
-                        final_dir = Path(cfg["storage"]["root_dir"]) / "tasks" / task_id
-                        result = DailyReportPipeline(cfg, self.db, self.storage, create_llm_judge(cfg)).run(user, payload, task_id, str(final_dir))
-                        self.db.finish_task(task_id, "finished", result)
-                        task = self.db.get_task(task_id, user)
-                        self._send_json({"ok": True, "task_id": task_id, "task_name": (task or {}).get("task_name", task_id), "summary": result.get("summary", {})}, HTTPStatus.CREATED)
-                    except Exception as exc:
-                        err_path = Path(cfg["storage"]["root_dir"]) / "tasks" / task_id / "errors.json"
-                        err_path.parent.mkdir(parents=True, exist_ok=True)
-                        err_path.write_text(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), encoding="utf-8")
-                        self.db.finish_task(task_id, "failed", {}, str(exc)); raise
+                    task = self.db.get_task(task_id, user)
+                    self._send_json({
+                        "ok": True,
+                        "task_id": task_id,
+                        "task_name": (task or {}).get("task_name", task_id),
+                        "status": "queued",
+                    }, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/tasks/") and path.endswith("/retry"):
+                user = self._require_manager(); task_id = path.split("/")[3]
+                if user:
+                    if not self.db.retry_task(task_id, user):
+                        return self._send_json({"ok": False, "error": "task_not_retryable"}, HTTPStatus.CONFLICT)
+                    self._send_json({"ok": True, "task_id": task_id, "status": "queued"}, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/tasks/") and path.endswith("/cancel"):
+                user = self._require_manager(); task_id = path.split("/")[3]
+                if user:
+                    task = self.db.get_task_status(task_id, user)
+                    if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
+                    if task.get("trigger_source") == "system_daily" and not can_admin(user):
+                        return self._send_json({"ok": False, "error": "only_admin_can_cancel_system_task"}, HTTPStatus.FORBIDDEN)
+                    status = self.db.cancel_task(task_id, user)
+                    self._send_json({"ok": True, "task_id": task_id, "status": status}, HTTPStatus.ACCEPTED)
             elif path == "/api/admin/test-llm":
                 user = self._require_admin()
                 if user:
@@ -408,7 +428,9 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except ValueError as exc:
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            message = str(exc)
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if isinstance(exc, RequestTooLarge) else HTTPStatus.CONFLICT if message.startswith("active_task_exists:") else HTTPStatus.BAD_REQUEST
+            self._send_json({"ok": False, "error": message}, status)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -451,7 +473,8 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True})
             else: self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except ValueError as exc:
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if isinstance(exc, RequestTooLarge) else HTTPStatus.BAD_REQUEST
+            self._send_json({"ok": False, "error": str(exc)}, status)
         except Exception as exc: self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_DELETE(self) -> None:
@@ -484,7 +507,10 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         task = self.db.get_task(task_id, user)
         if not task: return self._send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
         if task.get("trigger_source") != "system_daily":
-            path = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id / name
+            attempt = int(task.get("current_attempt") or 1)
+            path = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id / f"attempt_{attempt}" / name
+            legacy_path = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id / name
+            if not path.exists() and legacy_path.exists(): path = legacy_path
             if not path.exists(): return self._send_json({"ok": False, "error": "file_not_found"}, HTTPStatus.NOT_FOUND)
             return self._send_bytes(path.read_bytes(), content_type, name)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -524,6 +550,11 @@ class DailyReportHandler(BaseHTTPRequestHandler):
     def _task_for_view(self, task: dict, user) -> dict:
         if task.get("trigger_source") != "system_daily":
             return task
+        summary_for_user = getattr(self.db, "get_task_summary_for_user", None)
+        if callable(summary_for_user) and task.get("partial_available"):
+            view = dict(task)
+            view["summary"] = summary_for_user(task["task_id"], int(task.get("current_attempt") or 1), user)
+            return view
         full_task = self.db.get_task(task["task_id"], user) or task
         cases = self._visible_task_cases(full_task, user)
         missing = self._visible_missing_reports(full_task, user)
@@ -546,6 +577,14 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                 raise ValueError("日报归属切换时间须为 HH:MM 格式")
             if not (0 <= hour <= 23 and 0 <= minute <= 59):
                 raise ValueError("日报归属切换时间须在 00:00 至 23:59 之间")
+        worker_count = payload.get("daily_duplicate.worker_count")
+        if worker_count is not None:
+            try:
+                workers = int(worker_count)
+            except (TypeError, ValueError):
+                raise ValueError("单任务并行数须为 1 至 8 的整数")
+            if str(worker_count).strip() != str(workers) or not 1 <= workers <= 8:
+                raise ValueError("单任务并行数须为 1 至 8 的整数")
         medium = payload.get("testcase_verification.self_history_medium_rate")
         high = payload.get("testcase_verification.self_history_high_rate")
         if medium is None and high is None:
@@ -645,18 +684,27 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         raise ValueError("该日报已超过可编辑时间")
 
     def _save_artifact(self, report: Report, user, file_item, artifact_type: str) -> str:
+        allowed_key = "allowed_code_ext" if artifact_type == "code" else "allowed_document_ext"
+        configured = self.config.get("upload", {}).get(allowed_key, [])
+        allowed = {str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in configured}
+        suffix = Path(str(file_item.filename or "")).suffix.lower()
+        if allowed and suffix not in allowed:
+            raise ValueError(f"不支持的{artifact_type}附件类型：{suffix or '无扩展名'}")
+        self._validate_upload_size(len(file_item.data))
         stored = self.storage.save_bytes(f"artifacts/{artifact_type}", file_item.filename, file_item.data, report.report_date)
         return self.db.save_artifact({"report_id": report.report_id, "owner_user_id": user.user_id, "department_id": user.department_id, "artifact_type": artifact_type, "original_filename": file_item.filename, "stored_path": stored.stored_path, "content_type": file_item.content_type, "file_size": stored.file_size, "content_hash": stored.content_hash})
 
     def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0")); raw = self.rfile.read(length).decode("utf-8")
+        length = int(self.headers.get("Content-Length", "0")); self._validate_upload_size(length)
+        raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw or "{}")
 
     def _read_multipart_or_json(self):
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):
             return self._read_json_body(), {}
-        length = int(self.headers.get("Content-Length", "0")); body = self.rfile.read(length)
+        length = int(self.headers.get("Content-Length", "0")); self._validate_upload_size(length)
+        body = self.rfile.read(length)
         msg = BytesParser(policy=default).parsebytes(f"Content-Type: {ctype}\r\n\r\n".encode() + body)
         fields, files = {}, {}
         for part in msg.iter_parts():
@@ -668,6 +716,11 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             else:
                 fields[name] = data.decode(part.get_content_charset() or "utf-8")
         return fields, files
+
+    def _validate_upload_size(self, length: int) -> None:
+        limit = max(1, int(self.config.get("upload", {}).get("max_file_mb", 50))) * 1024 * 1024
+        if int(length) > limit:
+            raise RequestTooLarge(f"请求或单个文件超过 {limit // 1024 // 1024} MB 限制")
 
     def _send_json(self, data, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -869,13 +922,10 @@ def run_server(config_path: str, host: str | None = None, port: int | None = Non
     DailyReportHandler.config = config; DailyReportHandler.storage = storage; DailyReportHandler.db = db
     bind_host = host or str(config.get("app", {}).get("host", "0.0.0.0")); bind_port = int(port or config.get("app", {}).get("port", 8000))
     server = ThreadingHTTPServer((bind_host, bind_port), DailyReportHandler)
-    scheduler = DailyDuplicateScheduler(config, db, storage)
-    scheduler.start()
     print(f"Daily Report V2 backend running at http://{bind_host}:{bind_port}")
     try:
         server.serve_forever()
     finally:
-        scheduler.stop()
         server.server_close()
 
 

@@ -2,21 +2,13 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-from src.core.pipeline import DailyReportPipeline
-from src.llm.factory import create_llm_judge
 from src.utils.dates import SHANGHAI_TIMEZONE
 
 
 class DailyDuplicateScheduler:
-    """Runs the company-wide duplicate check once per Shanghai calendar day.
-
-    This scheduler intentionally assumes one backend process.  A multi-instance
-    deployment must move this responsibility to a singleton worker or add a
-    distributed lock.
-    """
+    """Enqueue the company-wide duplicate check once per Shanghai calendar day."""
 
     def __init__(self, config: dict[str, Any], db, storage) -> None:
         self.config, self.db, self.storage = config, db, storage
@@ -64,20 +56,9 @@ class DailyDuplicateScheduler:
 
     def _run(self, report_date: str) -> tuple[str, bool]:
         payload = {"report_date_start": report_date, "report_date_end": report_date, "trigger_source": "system_daily"}
-        task_id, should_run = self.db.begin_automatic_task(
+        return self.db.begin_automatic_task(
             report_date,
             payload,
             self.config,
             f"tasks/pending_system_{report_date}",
         )
-        if not should_run:
-            return task_id, False
-        result_dir = Path(self.config["storage"]["root_dir"]) / "tasks" / task_id
-        try:
-            result = DailyReportPipeline(self.config, self.db, self.storage, create_llm_judge(self.config)).run(
-                None, payload, task_id, str(result_dir)
-            )
-            self.db.finish_task(task_id, "finished", result)
-        except Exception as exc:
-            self.db.finish_task(task_id, "failed", {}, str(exc))
-        return task_id, True

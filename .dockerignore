@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+storage/*
+.env
+*.sqlite3
+*.db
+config/llm_api_key
+backend/config/llm_api_key

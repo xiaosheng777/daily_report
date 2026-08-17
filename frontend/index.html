@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>日报核验系统</title>
+  <link rel="stylesheet" href="/styles.css?v=20260814-task-console" />
+</head>
+<body>
+  <a class="skip-link" href="#mainContent">跳到主要内容</a>
+  <section class="login-panel" id="loginPanel">
+    <div class="login-layout">
+      <div class="login-intro" aria-hidden="true">
+        <div class="login-brand"><span class="login-brand-mark">DR</span><span>Daily Report Workspace</span></div>
+        <p class="eyebrow">Daily operations</p>
+        <h2>让日报成为清晰、可追溯的工作记录。</h2>
+        <p>统一完成日报提交、团队查重、测试用例核验与周期报表导出。</p>
+        <div class="login-flow"><span>记录</span><i></i><span>核验</span><i></i><span>汇总</span></div>
+      </div>
+      <div class="login-card">
+      <form id="loginForm">
+        <p class="eyebrow">Welcome back</p><h1>登录日报核验</h1><p class="form-intro">使用组织账号进入你的工作台。</p>
+        <label><span>账号</span><input name="username" required autocomplete="username" /></label>
+        <label><span>密码</span><input name="password" required type="password" autocomplete="current-password" /></label>
+        <button class="primary" type="submit">登录</button>
+        <button class="link-button" type="button" id="showRegister">注册员工账号</button>
+        <p id="loginMessage" class="message" aria-live="polite"></p>
+      </form>
+      <form id="registerForm" class="hidden">
+        <p class="eyebrow">Create account</p><h2>注册员工账号</h2><p class="form-intro">注册后即可提交并查看个人日报。</p>
+        <label><span>账号</span><input name="username" required /></label>
+        <label><span>密码</span><input name="password" required type="password" /></label>
+        <label><span>姓名</span><input name="display_name" required /></label>
+        <label><span>部门</span><select name="department_id" id="registerDepartment" required></select></label>
+        <label><span>小组</span><select name="group_id" id="registerGroup" required></select></label>
+        <button class="secondary" type="submit">注册</button>
+        <button class="link-button" type="button" id="showLogin">返回登录</button>
+        <p id="registerMessage" class="message" aria-live="polite"></p>
+      </form>
+      </div>
+    </div>
+  </section>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">DR</span><span class="brand-copy"><strong>日报核验</strong><small>REPORT WORKSPACE</small></span></div>
+      <nav class="tabs" aria-label="主要功能">
+        <span class="nav-caption business-only">日常工作</span>
+        <button type="button" class="tab business-only active" data-panel="employee"><span class="tab-index">01</span><span>日报录入</span></button>
+        <button type="button" class="tab business-only" data-panel="myReports"><span class="tab-index">02</span><span>日报记录</span></button>
+        <button type="button" class="tab exporter-only" data-panel="periodicReports"><span class="tab-index">03</span><span>周报月报</span></button>
+        <span class="nav-caption manager-only">团队核验</span>
+        <button type="button" class="tab manager-only" data-panel="manager"><span class="tab-index">04</span><span>查重任务</span></button>
+        <button type="button" class="tab manager-only" data-panel="taskHistory"><span class="tab-index">05</span><span>查重记录</span></button>
+        <button type="button" class="tab manager-only" data-panel="snapshots"><span class="tab-index">06</span><span>测试总表</span></button>
+        <span class="nav-caption admin-only">系统配置</span>
+        <button type="button" class="tab admin-only" data-panel="taskConsole"><span class="tab-index">07</span><span>任务管理台</span></button>
+        <button type="button" class="tab admin-only" data-panel="resourceMonitor"><span class="tab-index">08</span><span>资源监控</span></button>
+        <button type="button" class="tab admin-only" data-panel="admin"><span class="tab-index">09</span><span>系统管理</span></button>
+        <button type="button" class="tab admin-only" data-panel="auditLogs"><span class="tab-index">10</span><span>审查日志</span></button>
+        <button type="button" class="tab admin-only" data-panel="runtimeLogs"><span class="tab-index">11</span><span>运行日志</span></button>
+      </nav>
+      <div class="account-card">
+        <span class="account-label">当前账号</span>
+        <div class="status-pill" id="statusPill">未登录</div>
+        <div class="org-chain" id="orgChain"></div>
+      </div>
+      <button type="button" class="logout-button" id="logoutButton">退出登录</button>
+    </aside>
+
+    <main id="mainContent">
+      <section class="panel active" id="employee">
+        <header class="panel-head"><div><p class="eyebrow">Report Entry</p><h1>日报录入</h1></div><button class="secondary" id="resetForm" type="button">清空内容</button></header>
+        <form id="reportForm" class="report-form">
+          <label><span>姓名</span><input name="name" readonly /></label>
+          <label><span>职务</span><input name="role_text" readonly /></label>
+          <label><span>部门</span><input name="department" readonly /></label>
+          <label><span>小组</span><input name="group" readonly /></label>
+          <label class="submission-time-field"><span>提交时间</span><input id="submissionTime" type="text" readonly title="服务器上海时间，不能手动修改" /><small id="submissionTimeNote" class="small-note">以提交时服务器上海时间为准；09:00 前提交的日报归入前一日查重，09:00 起归入当天。</small></label>
+          <label class="manager-field"><span>直属领导</span><input name="manager" placeholder="组织未完善时请手工填写" /></label>
+          <label class="wide"><span>标题总结</span><input name="title_summary" required placeholder="完成订单导出接口联调" /></label>
+          <label class="wide"><span>工作描述</span><textarea name="work_description" required rows="7" placeholder="描述今天完成的工作、产出和下一步。"></textarea></label>
+          <div class="wide simple-block">
+            <div class="section-head"><span>测试用例相关工作</span></div>
+            <label class="file-pair"><span>当日个人测试用例 Excel（可选）</span><input type="file" id="testcaseFiles" accept=".xlsx" /></label>
+            <p class="small-note">上传 .xlsx，系统读取名为「日报」的 sheet，作为本人当日测试用例依据；并与组长上传的小组汇总表对照。</p>
+          </div>
+          <div class="wide simple-block">
+            <div class="section-head"><span>代码相关工作</span><button class="secondary" type="button" id="addCodeRow">新增一行</button></div>
+            <div class="table-wrap"><table><thead><tr><th>文件名</th><th>语言</th><th>类型</th><th>说明</th><th></th></tr></thead><tbody id="codeBody"></tbody></table></div>
+            <label class="file-pair"><span>代码附件（可选）</span><input type="file" id="codeFiles" multiple /></label>
+          </div>
+          <div class="wide simple-block">
+            <div class="section-head"><span>文档相关工作</span><button class="secondary" type="button" id="addDocumentRow">新增一行</button></div>
+            <div class="table-wrap"><table><thead><tr><th>文档名</th><th>类型</th><th>工作类型</th><th>说明</th><th></th></tr></thead><tbody id="documentBody"></tbody></table></div>
+            <label class="file-pair"><span>文档附件（可选）</span><input type="file" id="documentFiles" multiple /></label>
+          </div>
+          <div class="form-actions wide"><button class="primary" id="submitReport" type="submit">提交日报</button><button class="secondary hidden" id="cancelReportEdit" type="button">取消更改</button><p id="formMessage" class="message"></p></div>
+        </form>
+      </section>
+
+      <section class="panel" id="myReports">
+        <header class="panel-head"><div><p class="eyebrow">Report Archive</p><h1>日报提交记录</h1></div><button class="secondary exporter-only" id="exportWord" type="button">导出筛选结果</button></header>
+        <div class="toolbar report-filters"><input id="reportName" placeholder="按姓名搜索" /><input id="reportStart" type="date" title="开始日期" /><input id="reportEnd" type="date" title="结束日期" /><select id="reportRole"><option value="">全部</option></select><button class="secondary" id="refreshMyReports">查询</button></div>
+        <div class="card"><div class="table-wrap"><table><thead><tr><th>查重归属日期</th><th>提交时间</th><th>姓名</th><th>职务</th><th>部门 / 小组</th><th>标题</th><th>状态</th><th>附件</th><th>操作</th></tr></thead><tbody id="myReportList"></tbody></table></div></div>
+      </section>
+
+      <section class="panel" id="periodicReports">
+        <header class="panel-head"><div><p class="eyebrow">Periodic Report Export</p><h1>周报月报</h1><p class="small-note">按当前账号权限导出：员工本人、组长本组、主任本部门、部长全公司。</p></div></header>
+        <section class="card">
+          <form id="periodicExportForm" class="task-form">
+            <label><span>报表类型</span><select name="report_type"><option value="weekly">周报</option><option value="monthly">月报</option></select></label>
+            <label><span>开始日期</span><input name="start" type="date" required /></label>
+            <label><span>结束日期</span><input name="end" type="date" required /></label>
+            <div class="form-actions"><button class="secondary" type="submit" data-periodic-format="docx">导出 Word</button><button class="primary" type="submit" data-periodic-format="xlsx">导出 Excel</button></div>
+            <p id="periodicExportMessage" class="message"></p>
+          </form>
+        </section>
+      </section>
+
+      <section class="panel" id="manager">
+        <header class="panel-head"><div><p class="eyebrow">Duplicate Review</p><h1>查重任务与结果</h1></div><div class="task-actions"><button class="secondary" id="clearTaskDisplay">清空任务显示</button><button class="primary" id="runCheck">快速运行</button></div></header>
+        <div class="metric-grid"><div class="metric"><span>本次日报</span><strong id="resultCount">-</strong></div><div class="metric danger"><span>高风险</span><strong id="highRiskCount">-</strong></div><div class="metric"><span>错误数</span><strong id="errorCount">-</strong></div><div class="metric"><span>可见日报</span><strong id="inputCount">-</strong></div></div>
+        <form id="taskForm" class="task-form">
+          <label><span>开始日期</span><input name="report_date_start" type="date" required /></label><label><span>结束日期</span><input name="report_date_end" type="date" required /></label><label><span>部门范围</span><select name="department_scope" id="departmentScope"></select></label><label><span>员工范围</span><input name="employee_scope" placeholder="留空表示权限范围内全部" /></label><button class="primary" type="submit">创建查重任务</button><p id="taskMessage" class="message" role="status" aria-live="polite"></p>
+        </form>
+        <div class="toolbar"><input id="taskStart" type="date" /><input id="taskEnd" type="date" /><select id="taskStatus"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="paused">已暂停</option><option value="finished">完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="terminated">已强制终止</option></select><button class="secondary" id="refreshTasks">刷新任务</button></div>
+        <div class="table-wrap compact"><table><thead><tr><th>任务</th><th>状态</th><th>摘要</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="taskList"></tbody></table></div>
+          <div class="result-heading"><strong id="selectedTaskLabel">最近一次任务结果</strong></div>
+          <div class="toolbar"><input id="searchBox" placeholder="搜索姓名、部门、日期、原因" /><input id="dateFilter" type="date" /><select id="riskFilter"><option value="">全部风险</option><option value="high">高风险</option><option value="medium">中风险</option><option value="low">低风险</option><option value="normal">正常</option><option value="unknown">未知</option></select></div>
+          <div id="reviewCaseList" class="case-list"></div>
+          <div class="result-heading"><strong id="missingReportLabel">缺报人员</strong></div>
+          <div class="card table-wrap compact"><table><thead><tr><th>日期</th><th>姓名</th><th>职务</th><th>部门 / 小组</th></tr></thead><tbody id="missingReportList"></tbody></table></div>
+      </section>
+
+      <section class="panel" id="taskHistory">
+        <header class="panel-head"><div><p class="eyebrow">Task Archive</p><h1>我的查重记录</h1><p class="small-note">这里只显示你创建的任务；任务页清空显示不会删除这里的记录。</p></div><button class="secondary" id="refreshTaskHistory">刷新</button></header>
+        <div class="card table-wrap compact"><table><thead><tr><th>任务</th><th>状态</th><th>摘要</th><th>创建时间</th><th>下载与操作</th></tr></thead><tbody id="taskHistoryList"></tbody></table></div>
+      </section>
+
+      <section class="panel" id="snapshots">
+        <header class="panel-head"><div><p class="eyebrow">Testcase Snapshot</p><h1>小组测试用例汇总</h1></div><button class="secondary" id="refreshSnapshots">刷新</button></header>
+        <section class="card">
+          <form id="snapshotForm" class="snapshot-row uploader-only">
+            <label><span>快照日期</span><input type="date" name="snapshot_date" required /></label>
+            <label id="snapshotGroupWrap"><span>小组</span><select name="group_id" id="snapshotGroup"></select></label>
+            <label><span>Excel 汇总表</span><input type="file" id="snapshotFile" accept=".xlsx" required /></label>
+            <button class="primary" type="submit">上传 / 替换</button>
+            <p id="snapshotMessage" class="message"></p>
+          </form>
+          <p class="small-note">组长上传本小组当天汇总（应覆盖组员当日全部用例）；主任可选择本部门下小组上传。Excel 需含 sheet「日报」。</p>
+          <div class="table-wrap compact"><table><thead><tr><th>部门</th><th>小组</th><th>日期</th><th>文件</th><th>上传时间</th><th>操作</th></tr></thead><tbody id="snapshotList"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="panel" id="taskConsole">
+        <header class="panel-head task-console-head"><div><p class="eyebrow">Queue Operations</p><h1>任务管理台</h1><p class="small-note">查看全系统查重队列，在安全检查点暂停任务，或立即终止异常进程。</p></div><div class="task-actions"><span class="console-refresh-note" id="taskConsoleRefreshNote">活动页自动刷新</span><button class="secondary" id="refreshTaskConsole" type="button">立即刷新</button></div></header>
+        <section class="worker-strip" id="taskWorkerStrip" aria-live="polite"><span class="worker-signal" aria-hidden="true"></span><div><strong id="taskWorkerState">正在读取 worker 状态</strong><span id="taskWorkerMeta">—</span></div></section>
+        <div class="metric-grid task-console-metrics">
+          <div class="metric running"><span>正在运行</span><strong id="consoleRunningCount">0</strong></div>
+          <div class="metric"><span>等待运行</span><strong id="consoleQueuedCount">0</strong></div>
+          <div class="metric paused"><span>已暂停</span><strong id="consolePausedCount">0</strong></div>
+          <div class="metric danger"><span>异常 / 终止</span><strong id="consoleAbnormalCount">0</strong></div>
+        </div>
+        <section class="card task-console-board">
+          <div class="console-toolbar-row">
+            <div class="console-view-switch" role="group" aria-label="任务视图"><button class="active" id="taskConsoleActive" type="button" aria-pressed="true">活动任务</button><button id="taskConsoleHistory" type="button" aria-pressed="false">历史任务</button></div>
+            <span class="small-note" id="taskConsoleResultNote"></span>
+          </div>
+          <form id="taskConsoleFilters" class="toolbar task-console-filters">
+            <label><span>状态</span><select id="consoleStatus"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="paused">已暂停</option><option value="finished">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="terminated">已强制终止</option></select></label>
+            <label><span>创建人</span><select id="consoleCreator"><option value="">全部创建人</option></select></label>
+            <label><span>来源</span><select id="consoleTrigger"><option value="">全部来源</option><option value="manual">手工任务</option><option value="system_daily">系统自动任务</option></select></label>
+            <label class="console-keyword"><span>任务 / 账号关键词</span><input id="consoleQuery" placeholder="任务名称、ID、账号或姓名" /></label>
+            <button class="primary" type="submit">筛选</button>
+          </form>
+          <p id="taskConsoleMessage" class="message" role="status" aria-live="polite"></p>
+          <div class="task-queue" id="taskConsoleList" aria-live="polite"></div>
+          <div class="audit-load-more"><button class="secondary hidden" id="taskConsoleLoadMore" type="button">加载更多历史任务</button></div>
+        </section>
+      </section>
+
+      <section class="panel" id="resourceMonitor">
+        <header class="panel-head resource-monitor-head">
+          <div><p class="eyebrow">System Resource Diagnosis</p><h1>资源监控</h1><p class="small-note">从任务执行链出发，判断卡顿发生在队列、计算、存储还是外部大模型。</p></div>
+          <div class="monitor-toolbar" aria-label="资源曲线时间范围">
+            <button type="button" class="monitor-range active" data-monitor-range="1h">1 小时</button>
+            <button type="button" class="monitor-range" data-monitor-range="6h">6 小时</button>
+            <button type="button" class="monitor-range" data-monitor-range="24h">24 小时</button>
+            <button type="button" class="monitor-range" data-monitor-range="7d">7 天</button>
+          </div>
+        </header>
+
+        <section class="system-verdict" id="resourceVerdict" data-status="loading" aria-live="polite">
+          <div class="verdict-signal" aria-hidden="true"><span></span></div>
+          <div><p class="verdict-label">系统判读</p><h2 id="resourceVerdictTitle">正在建立资源视图…</h2><p id="resourceVerdictEvidence">任务和应用状态会先显示，Docker 侧车数据随后补齐。</p></div>
+          <div class="verdict-meta"><span id="resourceCollectedAt">尚未采集</span><span id="resourceSourceState">采集器连接中</span></div>
+        </section>
+        <p id="resourceMonitorMessage" class="message" role="status" aria-live="polite"></p>
+
+        <section class="monitor-section">
+          <div class="monitor-section-head"><div><p class="eyebrow">Bottleneck Trace</p><h2>任务执行链</h2></div><button type="button" class="secondary" id="resourceToTaskConsole">打开任务管理台</button></div>
+          <div class="execution-chain" id="resourceExecutionChain" aria-label="任务执行链">
+            <div class="chain-node" data-chain-stage="queued"><span>01</span><strong>排队</strong><small id="chainQueueNote">等待任务 0</small></div>
+            <i aria-hidden="true"></i>
+            <div class="chain-node" data-chain-stage="worker"><span>02</span><strong>Worker</strong><small id="chainWorkerNote">等待心跳</small></div>
+            <i aria-hidden="true"></i>
+            <div class="chain-node" data-chain-stage="local"><span>03</span><strong>本地计算</strong><small id="chainLocalNote">文本 / 附件</small></div>
+            <i aria-hidden="true"></i>
+            <div class="chain-node" data-chain-stage="llm"><span>04</span><strong>LLM 复核</strong><small id="chainLlmNote">无活跃调用</small></div>
+            <i aria-hidden="true"></i>
+            <div class="chain-node" data-chain-stage="export"><span>05</span><strong>结果导出</strong><small id="chainExportNote">等待任务完成</small></div>
+          </div>
+        </section>
+
+        <div class="monitor-layout">
+          <section class="monitor-section monitor-diagnoses">
+            <div class="monitor-section-head"><div><p class="eyebrow">Current Findings</p><h2>当前异常与建议</h2></div><span class="monitor-count" id="resourceDiagnosisCount">0 项</span></div>
+            <div id="resourceDiagnosisList" class="diagnosis-list"><div class="monitor-empty">正在分析当前状态…</div></div>
+          </section>
+
+          <section class="monitor-section monitor-dependencies">
+            <div class="monitor-section-head"><div><p class="eyebrow">Dependencies</p><h2>依赖状态</h2></div></div>
+            <div class="dependency-grid" id="resourceDependencyGrid"></div>
+          </section>
+        </div>
+
+        <section class="monitor-section">
+          <div class="monitor-section-head"><div><p class="eyebrow">Host Pressure</p><h2>主机资源压力</h2></div><span class="small-note" id="resourceHistoryNote">最近 1 小时 · 每分钟</span></div>
+          <div class="resource-metric-grid">
+            <article class="resource-metric"><div><span>CPU</span><strong id="resourceHostCpu">—</strong></div><div class="pressure-track"><span id="resourceHostCpuBar"></span></div><div class="resource-sparkline" data-resource-chart="cpu_percent" aria-label="CPU 历史曲线"></div></article>
+            <article class="resource-metric"><div><span>内存</span><strong id="resourceHostMemory">—</strong></div><div class="pressure-track"><span id="resourceHostMemoryBar"></span></div><div class="resource-sparkline" data-resource-chart="memory_percent" aria-label="内存历史曲线"></div></article>
+            <article class="resource-metric"><div><span>存储</span><strong id="resourceHostDisk">—</strong></div><div class="pressure-track"><span id="resourceHostDiskBar"></span></div><div class="resource-sparkline" data-resource-chart="disk_percent" aria-label="存储历史曲线"></div></article>
+            <article class="resource-metric"><div><span>I/O 等待</span><strong id="resourceHostIo">—</strong></div><div class="pressure-track"><span id="resourceHostIoBar"></span></div><div class="resource-sparkline" data-resource-chart="io_pressure" aria-label="I/O 压力历史曲线"></div></article>
+          </div>
+        </section>
+
+        <section class="monitor-section">
+          <div class="monitor-section-head"><div><p class="eyebrow">Docker Allowlist</p><h2>容器状态与资源</h2></div><span class="small-note">仅展示配置白名单，不读取环境变量、挂载内容或日志</span></div>
+          <div class="table-wrap compact"><table class="resource-container-table"><thead><tr><th>容器</th><th>状态</th><th>CPU / 配额</th><th>内存</th><th>CPU 限流</th><th>块 I/O</th><th>网络</th><th>重启</th></tr></thead><tbody id="resourceContainerList"><tr><td colspan="8">等待 Docker 指标…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="panel" id="admin">
+        <header class="panel-head"><div><p class="eyebrow">System Administration</p><h1>系统管理</h1></div></header>
+        <div class="admin-grid">
+          <section class="card"><h2>账号与组织归属</h2><form id="userForm" class="admin-form"><input name="username" placeholder="账号" required /><input name="password" placeholder="初始密码" /><input name="display_name" placeholder="姓名" required /><select name="role" id="userRole"><option value="employee">员工</option><option value="group_leader">组长</option><option value="director">主任</option><option value="minister">部长</option><option value="admin">管理员</option></select><select name="department_id" id="userDepartment"></select><select name="group_id" id="userGroup"></select><button class="secondary">新增账号</button></form><p id="userMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>账号</th><th>姓名</th><th>职务</th><th>部门</th><th>小组</th><th class="user-manager-heading">直属领导</th><th class="user-status-heading">状态</th><th class="user-actions-heading">操作</th></tr></thead><tbody id="userList"></tbody></table></div></section>
+          <section class="card"><h2>部门管理</h2><form id="departmentForm" class="admin-form"><input name="name" placeholder="部门名称" required /><input name="parent_department_id" placeholder="上级部门 ID，可空" /><button class="secondary">新增部门</button></form><p id="departmentMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>ID</th><th>部门</th><th>上级</th><th class="user-status-heading">状态</th><th class="user-actions-heading">操作</th></tr></thead><tbody id="departmentList"></tbody></table></div></section>
+          <section class="card"><h2>小组管理</h2><form id="groupForm" class="admin-form"><input name="name" placeholder="小组名称" required /><select name="department_id" id="groupDepartment" required></select><button class="secondary">新增小组</button></form><p id="groupMessage" class="message" aria-live="polite"></p><div class="table-wrap compact"><table><thead><tr><th>ID</th><th>部门</th><th>小组</th><th class="user-status-heading">状态</th><th class="user-actions-heading">操作</th></tr></thead><tbody id="groupList"></tbody></table></div></section>
+          <section class="card"><h2>参数配置</h2><form id="settingsForm" class="settings-form"></form><p id="settingsMessage" class="message"></p></section>
+          <section class="card"><h2>运维工具</h2><div class="system-actions"><button class="secondary" id="testLlm">测试大模型连接</button><button class="secondary" id="cleanupSessions">清理过期会话</button><button class="secondary" id="storageStats">查看存储占用</button></div><p id="systemMessage" class="message"></p></section>
+          <section class="card danger-zone"><h2>清除业务数据</h2><p>清除日报、附件、测试总表、查重任务、导出文件、LLM 原始日志和当前会话。账号、部门、小组、系统参数及审查日志会保留。</p><button class="danger-button" id="resetBusinessData">清除全部业务数据</button><p id="resetMessage" class="message"></p></section>
+        </div>
+      </section>
+
+      <section class="panel" id="auditLogs">
+        <header class="panel-head"><div><p class="eyebrow">Administration Audit</p><h1>审查日志</h1><p class="small-note">记录安全事件、管理操作、关键业务变更和批量导出；保留 180 天且不可手工删除。</p></div></header>
+        <div class="metric-grid audit-metrics">
+          <div class="metric"><span>筛选范围事件</span><strong id="auditTotal">0</strong></div>
+          <div class="metric danger"><span>失败事件</span><strong id="auditFailed">0</strong></div>
+          <div class="metric danger"><span>严重事件</span><strong id="auditCritical">0</strong></div>
+          <div class="metric"><span>登录失败</span><strong id="auditLoginFailed">0</strong></div>
+        </div>
+        <section class="card">
+          <form id="auditFilterForm" class="toolbar audit-filters">
+            <label><span>开始日期</span><input id="auditStart" name="start" type="date" /></label>
+            <label><span>结束日期</span><input id="auditEnd" name="end" type="date" /></label>
+            <label><span>类别</span><select id="auditCategory" name="category"><option value="">全部类别</option><option value="authentication">账号安全</option><option value="administration">管理操作</option><option value="business">关键业务</option><option value="export">批量导出</option></select></label>
+            <label><span>级别</span><select id="auditSeverity" name="severity"><option value="">全部级别</option><option value="critical">严重</option><option value="warning">警告</option><option value="info">信息</option></select></label>
+            <label><span>结果</span><select id="auditOutcome" name="outcome"><option value="">全部结果</option><option value="success">成功</option><option value="failure">失败</option></select></label>
+            <label class="audit-keyword"><span>操作者 / 目标关键词</span><input id="auditQuery" name="q" placeholder="账号、姓名、动作、目标 ID 或摘要" /></label>
+            <div class="form-actions"><button class="primary" type="submit">查询</button><button class="secondary" id="auditExport" type="button">导出 CSV</button></div>
+          </form>
+          <p id="auditMessage" class="message" aria-live="polite"></p>
+          <div class="table-wrap compact"><table class="audit-table"><thead><tr><th>时间</th><th>级别</th><th>结果</th><th>操作者</th><th>动作</th><th>目标</th><th>来源 IP</th><th>摘要</th><th>详情</th></tr></thead><tbody id="auditLogList"></tbody></table></div>
+          <div class="audit-load-more"><button class="secondary hidden" id="auditLoadMore" type="button">加载更多</button></div>
+        </section>
+      </section>
+
+      <section class="panel" id="runtimeLogs">
+        <header class="panel-head runtime-log-head"><div><p class="eyebrow">Live Runtime</p><h1>运行日志</h1><p class="small-note">实时查看 Web、Worker、调度、任务、模型和监控进程的关键运行状态；日志自动脱敏并保留 7 天。</p></div><div class="runtime-stream-state"><span id="runtimeStreamDot" aria-hidden="true"></span><span id="runtimeStreamState">等待连接</span></div></header>
+        <section class="card runtime-log-card">
+          <form id="runtimeLogFilterForm" class="toolbar runtime-log-filters">
+            <label><span>开始日期</span><input id="runtimeLogStart" type="date" /></label>
+            <label><span>结束日期</span><input id="runtimeLogEnd" type="date" /></label>
+            <label><span>级别</span><select id="runtimeLogLevel"><option value="">全部级别</option><option value="error">错误</option><option value="warning">警告</option><option value="info">信息</option></select></label>
+            <label><span>来源</span><select id="runtimeLogSource"><option value="">全部来源</option><option value="web">Web 服务</option><option value="worker">后台 Worker</option><option value="scheduler">自动调度</option><option value="task">查重任务</option><option value="llm">大模型</option><option value="monitor">资源监控</option></select></label>
+            <label><span>任务 ID</span><input id="runtimeLogTaskId" placeholder="任务 ID，可部分匹配" /></label>
+            <label class="runtime-log-keyword"><span>关键词</span><input id="runtimeLogQuery" placeholder="事件、消息或错误内容" /></label>
+            <div class="form-actions"><button class="primary" type="submit">应用筛选</button><label class="runtime-follow"><input id="runtimeLogFollow" type="checkbox" checked /> 实时滚动</label></div>
+          </form>
+          <p id="runtimeLogMessage" class="message" aria-live="polite"></p>
+          <div class="runtime-terminal" aria-live="polite"><div class="table-wrap compact"><table class="runtime-log-table"><thead><tr><th>时间</th><th>级别</th><th>来源</th><th>事件</th><th>任务</th><th>运行信息</th><th>详情</th></tr></thead><tbody id="runtimeLogList"></tbody></table></div></div>
+          <div class="audit-load-more"><button class="secondary hidden" id="runtimeLogLoadMore" type="button">加载更早日志</button></div>
+        </section>
+      </section>
+    </main>
+  </div>
+  <dialog class="password-reset-dialog" id="passwordResetDialog" aria-labelledby="passwordResetTitle">
+    <form id="passwordResetForm" class="password-reset-form">
+      <input id="passwordResetUserId" type="hidden" />
+      <p class="eyebrow">Account security</p>
+      <h2 id="passwordResetTitle">重置密码</h2>
+      <p class="form-intro">为 <strong id="passwordResetUsername">该账号</strong> 设置新密码。保存后，该账号当前所有登录会话都会失效。</p>
+      <label><span>新密码</span><input id="passwordResetNew" type="password" autocomplete="new-password" minlength="6" required /></label>
+      <label><span>确认新密码</span><input id="passwordResetConfirm" type="password" autocomplete="new-password" minlength="6" required /></label>
+      <div class="password-reset-actions"><button class="secondary" id="passwordResetCancel" type="button">取消</button><button class="primary" type="submit">确认重置</button></div>
+      <p id="passwordResetMessage" class="message" aria-live="polite"></p>
+    </form>
+  </dialog>
+<script src="/app.js?v=20260817-runtime-logs"></script>
+</body>
+</html>

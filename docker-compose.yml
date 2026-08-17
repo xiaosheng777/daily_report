@@ -1,0 +1,76 @@
+services:
+  daily-report-backend:
+    image: daily-report-backend:latest
+    container_name: daily-report-backend
+    restart: always
+    volumes:
+      # Keep application source outside the image so an offline server can apply
+      # source-only fixes and restart the service without rebuilding an image.
+      - ./backend/src:/app/backend/src:ro
+      - ./config/config.yaml:/app/backend/config/config.yaml:ro
+      - ./config/llm_api_key:/app/backend/config/llm_api_key:ro
+      - ./storage:/app/storage
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/time', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  daily-report-worker:
+    image: daily-report-backend:latest
+    container_name: daily-report-worker
+    restart: always
+    depends_on:
+      - daily-report-backend
+    command: ["python", "-m", "src.worker", "--config", "config/config.yaml"]
+    cpus: 2.0
+    mem_limit: 8g
+    volumes:
+      - ./backend/src:/app/backend/src:ro
+      - ./config/config.yaml:/app/backend/config/config.yaml:ro
+      - ./config/llm_api_key:/app/backend/config/llm_api_key:ro
+      - ./storage:/app/storage
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3,datetime; d=sqlite3.connect('/app/storage/daily_report.sqlite3').execute(\"select heartbeat_at from worker_leases where lease_name='duplicate-worker'\").fetchone(); now=datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None); assert d and 0<=(now-datetime.datetime.fromisoformat(d[0])).total_seconds()<90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  daily-report-monitor:
+    image: daily-report-backend:latest
+    container_name: daily-report-monitor
+    restart: always
+    command: ["python", "-m", "src.monitoring.collector", "--config", "config/config.yaml"]
+    cpus: 0.5
+    mem_limit: 256m
+    volumes:
+      - ./backend/src:/app/backend/src:ro
+      - ./config/config.yaml:/app/backend/config/config.yaml:ro
+      - ./storage:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+      - /sys/fs/cgroup:/host/cgroup:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/internal/snapshot', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  daily-report-web:
+    image: nginx:alpine
+    container_name: daily-report-web
+    restart: always
+    depends_on:
+      - daily-report-backend
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

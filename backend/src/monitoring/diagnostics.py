@@ -65,11 +65,11 @@ def diagnose(infra: dict, app: dict, history: list[dict], stale_seconds: int) ->
         elif memory >= 85:
             diagnoses.append(_diagnosis("warning", "container_memory", f"{name} 内存压力较高", f"已使用容器内存上限的 {memory:.1f}%。", "观察任务结束后是否回落，并检查附件规模。"))
         if cpu >= 95 or throttled >= 20:
-            diagnoses.append(_diagnosis("critical", "container_cpu", f"{name} CPU 已受限", f"配额使用 {cpu:.1f}%，调度周期限流 {throttled:.1f}%。", "降低单任务并行数，或为该容器增加 CPU 配额。"))
+            diagnoses.append(_diagnosis("critical", "container_cpu", f"{name} CPU 已受限", f"配额使用 {cpu:.1f}%，调度周期限流 {throttled:.1f}%。", "降低本地查重或任务并行数，并检查宿主机上的其他 CPU 负载。"))
         elif cpu >= 85:
             recent = [float(((point.get("containers") or {}).get(name) or {}).get("cpu_percent") or 0) for point in history[-5:]]
             if len(recent) >= 5 and all(value >= 85 for value in recent):
-                diagnoses.append(_diagnosis("warning", "container_cpu", f"{name} CPU 持续繁忙", f"最近 5 分钟配额使用率均高于 85%，当前 {cpu:.1f}%。", "任务以本地计算为主时可降低并行数或增加 CPU 配额。"))
+                diagnoses.append(_diagnosis("warning", "container_cpu", f"{name} CPU 持续繁忙", f"最近 5 分钟配额使用率均高于 85%，当前 {cpu:.1f}%。", "任务以本地计算为主时可降低 local_worker_count 或 max_concurrent_tasks。"))
     disk_total = int(host.get("disk_total_bytes") or 0)
     disk_free = int(host.get("disk_free_bytes") or 0)
     free_percent = disk_free / disk_total * 100 if disk_total else 100
@@ -104,7 +104,7 @@ def diagnose(infra: dict, app: dict, history: list[dict], stale_seconds: int) ->
             if llm_active:
                 cause, recommendation = "任务正在等待大模型响应", "检查内网模型服务负载与网络；当前应用不会自动发起额外探测。"
             elif float(worker.get("cpu_percent") or 0) >= 85:
-                cause, recommendation = "worker CPU 可能是瓶颈", "降低日报检查并行数，或增加 worker CPU 配额。"
+                cause, recommendation = "worker CPU 可能是瓶颈", "降低 local_worker_count 或 max_concurrent_tasks。"
             elif float(worker.get("memory_percent") or 0) >= 85:
                 cause, recommendation = "worker 内存可能是瓶颈", "降低并行数并检查本次任务附件规模。"
             elif io_pressure >= 10:
@@ -165,7 +165,7 @@ def build_snapshot(config: dict, db) -> dict:
     overall = "critical" if any(item["severity"] == "critical" for item in diagnoses) else "warning" if diagnoses else "healthy"
     active_task = next((task for task in app.get("active") or [] if task.get("status") == "running"), None)
     stage = str((active_task or {}).get("progress_stage") or ("queued" if app.get("counts", {}).get("queued") else "idle"))
-    chain_stage = "llm" if dependencies["llm"].get("active_count") else "local" if stage in {"loading", "preparing", "checking", "starting", "resuming"} else "export" if stage == "exporting" else stage
+    chain_stage = "llm" if stage == "llm_judging" or dependencies["llm"].get("active_count") else "local" if stage in {"loading", "preparing", "checking", "starting", "resuming", "local_filtering"} else "export" if stage == "exporting" else stage
     return {
         "overall_status": overall,
         "diagnoses": diagnoses,

@@ -23,8 +23,9 @@ services:
     depends_on:
       - daily-report-backend
     command: ["python", "-m", "src.worker", "--config", "config/config.yaml"]
-    cpus: 2.0
-    mem_limit: 8g
+    # Do not cap CPU: local duplicate filtering is CPU-bound and is controlled
+    # by daily_duplicate.local_worker_count instead.
+    mem_limit: 64g
     volumes:
       - ../backend/src:/app/backend/src:ro
       - ../config/config.yaml:/app/backend/config/config.yaml:ro

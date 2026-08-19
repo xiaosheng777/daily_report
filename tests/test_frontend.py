@@ -17,7 +17,8 @@ def test_auth_and_role_navigation_guards_are_present():
     assert "function canManage(){return ['group_leader','director','minister'].includes(state.user?.role)}" in script
     assert "function canExportReports()" in script
     assert "daily_report_submission.rollover_time':'日报归属切换时间'" in script
-    assert "daily_duplicate.report_worker_count':'日报检查并行数（1-8）'" in script
+    assert "daily_duplicate.local_worker_count':'本地查重并行数（1-32）'" in script
+    assert "daily_duplicate.report_worker_count':'旧版日报并行数（兼容）'" in script
     assert "本地查重：${Number(checked)}/${Number(total)}" in script
     assert "LLM复核：${Number(summary.llm_review_count||0)}" in script
     assert "降级本地判断：${Number(summary.degraded_local_count||0)}" in script

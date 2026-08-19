@@ -6,7 +6,7 @@ import re
 import subprocess
 import tempfile
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -45,7 +45,8 @@ class TaskTerminated(RuntimeError):
     """Raised when the worker requested immediate administrative termination."""
 
 
-MAX_REPORT_WORKERS = 8
+MAX_LEGACY_REPORT_WORKERS = 8
+MAX_LOCAL_WORKERS = 32
 
 
 class DailyReportPipeline:
@@ -64,6 +65,9 @@ class DailyReportPipeline:
         self._task_reports_all: list[Report] = []
         self._normalized_text_by_id: dict[str, str] = {}
         self._text_hash_by_id: dict[str, str] = {}
+        self._reports_by_user_date: dict[tuple[str, str], list[Report]] = {}
+        self._reports_by_department_date: dict[tuple[str, str], list[Report]] = {}
+        self._reports_by_date: dict[str, list[Report]] = {}
 
     def run(
         self,
@@ -86,6 +90,7 @@ class DailyReportPipeline:
         history_end = str(scope.get("report_date_end") or "")
         reports_all = self.db.list_reports(None, start=history_start, end=history_end) if not user or user.role == "admin" else self.db.list_reports(user, start=history_start, end=history_end)
         self._task_reports_all = reports_all
+        duplicate_context = self._prepare_duplicate_context(reports_all)
         list_artifacts = getattr(self.db, "list_artifacts_for_reports", None)
         if callable(list_artifacts):
             self._artifact_cache.update(list_artifacts([report.report_id for report in reports_all]))
@@ -93,7 +98,16 @@ class DailyReportPipeline:
         completed = {str(case.get("report_id") or ""): case for case in (resume_cases or []) if case.get("report_id")}
         completed = {report_id: case for report_id, case in completed.items() if any(report.report_id == report_id for report in current_reports)}
         progress("preparing", len(completed), len(current_reports), f"已加载 {len(reports_all)} 份候选日报")
-        report_cases = self._build_cases_resumable(current_reports, reports_all, completed, progress, case_callback, control)
+        report_cases = self._build_cases_resumable(
+            current_reports,
+            reports_all,
+            completed,
+            progress,
+            case_callback,
+            control,
+            duplicate_context,
+        )
+        self._run_llm_judgement(report_cases, reports_all, progress, case_callback, control)
         missing_reports = self._find_missing_reports(current_reports, user, scope)
         payload = {
             "task_id": task_id,
@@ -137,28 +151,28 @@ class DailyReportPipeline:
         progress: Callable[[str, int, int, str], None],
         case_callback: Callable[[dict[str, Any]], None] | None,
         control: Callable[[], str],
+        duplicate_context: tuple[dict[str, int], Any] | None = None,
     ) -> list[dict[str, Any]]:
-        try:
-            configured_workers = int(self.daily_cfg.get("report_worker_count", 3))
-        except (TypeError, ValueError):
-            configured_workers = 3
-        batch_size = max(1, min(MAX_REPORT_WORKERS, configured_workers))
         remaining = [report for report in current_reports if report.report_id not in completed]
         total = len(current_reports)
         completed_count = len(completed)
-        for offset in range(0, len(remaining), batch_size):
-            self._raise_for_control(control())
-            batch = remaining[offset:offset + batch_size]
+        if not remaining:
+            return [completed[report.report_id] for report in current_reports if report.report_id in completed]
 
-            def batch_progress(stage: str, current: int, _batch_total: int, message: str = "") -> None:
-                progress(stage, min(total, completed_count + current), total, message)
+        self._raise_for_control(control())
 
-            batch_cases = self._build_cases(batch, all_reports, batch_progress, case_callback)
-            for case in batch_cases:
-                completed[case.report_id] = case.to_dict()
-            completed_count += len(batch_cases)
-            progress("checking", completed_count, total, f"已完成 {completed_count}/{total} 份日报")
-            self._raise_for_control(control())
+        def queue_progress(_stage: str, current: int, _queue_total: int, message: str = "") -> None:
+            progress("local_filtering", min(total, completed_count + current), total, message)
+
+        # Submit the whole remaining queue to the bounded executor.  In contrast to
+        # the old fixed-size batches, each worker immediately receives another
+        # report when it finishes, so a slow report cannot idle the other workers.
+        cases = self._build_cases(remaining, all_reports, queue_progress, case_callback, duplicate_context)
+        for case in cases:
+            completed[case.report_id] = case.to_dict()
+        completed_count += len(cases)
+        progress("local_filtering", completed_count, total, f"本地筛选已完成 {completed_count}/{total} 份日报")
+        self._raise_for_control(control())
         return [completed[report.report_id] for report in current_reports if report.report_id in completed]
 
     def _history_start(self, start: str) -> str:
@@ -242,19 +256,10 @@ class DailyReportPipeline:
         all_reports: list[Report],
         progress_callback: Callable[[str, int, int, str], None] | None = None,
         case_callback: Callable[[dict[str, Any]], None] | None = None,
+        duplicate_context: tuple[dict[str, int], Any] | None = None,
     ) -> list[ReviewCase]:
         progress = progress_callback or (lambda _stage, _current, _total, _message="": None)
-        texts = [normalize_text(r.title_summary, r.work_description) for r in all_reports]
-        self._normalized_text_by_id = {report.report_id: text for report, text in zip(all_reports, texts)}
-        self._text_hash_by_id = {report_id: stable_hash(text) for report_id, text in self._normalized_text_by_id.items()}
-        matrix = None
-        try:
-            if any(texts):
-                vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=1)
-                matrix = vectorizer.fit_transform(texts)
-        except Exception:
-            matrix = None
-        index_by_id = {r.report_id: i for i, r in enumerate(all_reports)}
+        index_by_id, matrix = duplicate_context or self._prepare_duplicate_context(all_reports)
         duplicate_checks = self._run_daily_duplicate_checks(current_reports, all_reports, index_by_id, matrix)
         group_extras_cache: dict[tuple[str, str], list[Finding]] = {}
         cases: list[ReviewCase] = []
@@ -285,6 +290,26 @@ class DailyReportPipeline:
             progress("checking", position, total, f"已完成 {position}/{total} 份日报")
         return cases
 
+    def _prepare_duplicate_context(self, reports: list[Report]) -> tuple[dict[str, int], Any]:
+        """Build the immutable duplicate-check data once for the current task."""
+        texts = [normalize_text(report.title_summary, report.work_description) for report in reports]
+        self._normalized_text_by_id = {report.report_id: text for report, text in zip(reports, texts)}
+        self._text_hash_by_id = {report_id: stable_hash(text) for report_id, text in self._normalized_text_by_id.items()}
+        self._reports_by_user_date = {}
+        self._reports_by_department_date = {}
+        self._reports_by_date = {}
+        for report in reports:
+            self._reports_by_user_date.setdefault((report.owner_user_id, report.report_date), []).append(report)
+            self._reports_by_department_date.setdefault((report.department_id, report.report_date), []).append(report)
+            self._reports_by_date.setdefault(report.report_date, []).append(report)
+        matrix = None
+        try:
+            if any(texts):
+                matrix = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=1).fit_transform(texts)
+        except Exception:
+            matrix = None
+        return {report.report_id: index for index, report in enumerate(reports)}, matrix
+
     def _run_daily_duplicate_checks(
         self,
         current_reports: list[Report],
@@ -294,11 +319,7 @@ class DailyReportPipeline:
     ) -> list[CheckResult]:
         if not current_reports:
             return []
-        try:
-            configured_workers = int(self.daily_cfg.get("report_worker_count", 3))
-        except (TypeError, ValueError):
-            configured_workers = 3
-        worker_count = min(len(current_reports), max(1, min(MAX_REPORT_WORKERS, configured_workers)))
+        worker_count = min(len(current_reports), self._local_worker_count())
 
         def check(report: Report) -> CheckResult:
             return self._safe_check(
@@ -310,6 +331,19 @@ class DailyReportPipeline:
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="daily-duplicate-report") as executor:
             # executor.map yields in input order even when individual reports finish out of order.
             return list(executor.map(check, current_reports))
+
+    def _local_worker_count(self) -> int:
+        if "local_worker_count" in self.daily_cfg:
+            try:
+                configured = int(self.daily_cfg["local_worker_count"])
+            except (TypeError, ValueError):
+                configured = 8
+            return max(1, min(MAX_LOCAL_WORKERS, configured))
+        try:
+            legacy = int(self.daily_cfg.get("report_worker_count", 3))
+        except (TypeError, ValueError):
+            legacy = 3
+        return max(1, min(MAX_LEGACY_REPORT_WORKERS, legacy))
 
     @staticmethod
     def _safe_check(checker_id: str, report: Report, callback: Callable[[], CheckResult]) -> CheckResult:
@@ -354,20 +388,15 @@ class DailyReportPipeline:
             reason = "标准化后文本完全一致" if cand["hash_same"] else f"候选相似度 {cand['candidate_score']:.2f}，建议复核"
             details = self._candidate_details(cand)
             requires_llm = cand["candidate_score"] >= llm_threshold or cand["hash_same"]
-            if requires_llm and self.llm_judge:
-                result = self.llm_judge.judge_duplicate(current.to_dict(), other.to_dict(), details)
-                details["llm_called"] = True
-                if result.ok:
-                    details["llm_reviewed"] = True
-                    risk = result.duplicate_risk
-                    reason = result.decision_summary or reason
-                    details["llm_confidence"] = result.confidence
-                    details["llm_raw"] = result.raw
-                else:
-                    details["degraded_to_local"] = True
-                    reason = f"大模型调用失败，已使用本地相似度：{result.error}"
-                    details["llm_error"] = result.error
-                    details["degraded_reason"] = "llm_call_failed"
+            if cand["hash_same"]:
+                details["llm_called"] = False
+                details["decision_source"] = "local_exact_match"
+            elif requires_llm and self.llm_judge:
+                # Persist this local finding before the LLM phase.  The stable pair
+                # id makes the pending queue resumable through task_case_results.
+                details["llm_called"] = False
+                details["llm_pending"] = True
+                details["llm_pair_id"] = self._llm_pair_id(current.report_id, other.report_id)
             else:
                 details["llm_called"] = False
                 if requires_llm:
@@ -378,6 +407,141 @@ class DailyReportPipeline:
         risk = highest_risk(f.risk_level for f in findings)
         summary = "；".join(f.reason for f in findings[:3])
         return CheckResult("report_duplicate_check", True, "success", risk, summary, findings)
+
+    def _run_llm_judgement(
+        self,
+        report_cases: list[dict[str, Any]],
+        reports: list[Report],
+        progress: Callable[[str, int, int, str], None],
+        case_callback: Callable[[dict[str, Any]], None] | None,
+        control: Callable[[], str],
+    ) -> None:
+        """Resolve persisted local duplicate pairs without recomputing local work."""
+        reports_by_id = {report.report_id: report for report in reports}
+        pending: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Report, Report]] = []
+        for case in report_cases:
+            current = reports_by_id.get(str(case.get("report_id") or ""))
+            if not current:
+                continue
+            duplicate_check = next(
+                (check for check in case.get("checks", []) if check.get("checker_id") == "report_duplicate_check"),
+                None,
+            )
+            if not duplicate_check:
+                continue
+            for finding in duplicate_check.get("findings", []):
+                details = finding.get("details") or {}
+                if not details.get("llm_pending"):
+                    continue
+                matched = reports_by_id.get(str(details.get("matched_report_id") or ""))
+                if matched:
+                    pending.append((case, duplicate_check, finding, current, matched))
+                else:
+                    details["llm_pending"] = False
+                    details["degraded_to_local"] = True
+                    details["degraded_reason"] = "matched_report_missing"
+                    details["llm_error"] = "matched report is unavailable"
+                    finding["reason"] = "候选日报不存在，已使用本地相似度"
+                    self._refresh_case_risk(case, duplicate_check)
+                    if case_callback:
+                        case_callback(case)
+
+        total = len(pending)
+        def report_queue_progress() -> None:
+            queued = max(0, total - completed - len(futures))
+            progress(
+                "llm_judging",
+                completed,
+                total,
+                f"LLM 判断：{completed} / {total}（active：{len(futures)}，queued：{queued}）",
+            )
+
+        # The progress message is persisted on the task and also provides
+        # per-task active/queued telemetry to the resource monitor.
+        futures: dict[Any, tuple[dict[str, Any], dict[str, Any], dict[str, Any], Report, Report]] = {}
+        completed = 0
+        progress("llm_judging", 0, total, f"LLM 判断：0 / {total}（active：0，queued：{total}）")
+        if not pending:
+            self._raise_for_control(control())
+            return
+        try:
+            configured_workers = int(self.config.get("llm_judge", {}).get("per_task_max_concurrency", 30))
+        except (TypeError, ValueError):
+            configured_workers = 30
+        worker_count = min(total, max(1, configured_workers))
+        pending_iter = iter(pending)
+        pending_action = ""
+
+        def submit_available(executor: ThreadPoolExecutor) -> None:
+            while not pending_action and len(futures) < worker_count:
+                try:
+                    item = next(pending_iter)
+                except StopIteration:
+                    return
+                case, duplicate_check, finding, current, matched = item
+                futures[executor.submit(self._judge_duplicate_pair, current, matched, finding.get("details") or {})] = item
+
+        self._raise_for_control(control())
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="daily-duplicate-llm") as executor:
+            submit_available(executor)
+            report_queue_progress()
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    case, duplicate_check, finding, _current, _matched = futures.pop(future)
+                    result = future.result()
+                    completed += 1
+                    pending_action = pending_action or control()
+                    self._apply_llm_result(case, duplicate_check, finding, result)
+                    if case_callback:
+                        case_callback(case)
+                submit_available(executor)
+                report_queue_progress()
+        self._raise_for_control(pending_action or control())
+
+    def _judge_duplicate_pair(self, current: Report, matched: Report, details: dict[str, Any]):
+        if not self.llm_judge:
+            from src.llm.base import LLMJudgeResult
+            return LLMJudgeResult(False, False, error="llm unavailable")
+        return self.llm_judge.judge_duplicate(current.to_dict(), matched.to_dict(), self._llm_signals(details))
+
+    def _apply_llm_result(self, case: dict[str, Any], duplicate_check: dict[str, Any], finding: dict[str, Any], result: Any) -> None:
+        details = finding.get("details") or {}
+        details["llm_pending"] = False
+        details["llm_called"] = True
+        finding["details"] = details
+        if result.ok:
+            details["llm_reviewed"] = True
+            details["llm_confidence"] = result.confidence
+            details["llm_raw"] = result.raw
+            finding["risk_level"] = result.duplicate_risk
+            finding["reason"] = result.decision_summary or str(finding.get("reason") or "")
+        else:
+            details["degraded_to_local"] = True
+            details["llm_error"] = result.error
+            details["degraded_reason"] = "llm_call_failed"
+            finding["reason"] = f"大模型调用失败，已使用本地相似度：{result.error}"
+        self._refresh_case_risk(case, duplicate_check)
+
+    @staticmethod
+    def _llm_pair_id(report_id: str, matched_report_id: str) -> str:
+        return f"{report_id}:{matched_report_id}"
+
+    @staticmethod
+    def _llm_signals(details: dict[str, Any]) -> dict[str, Any]:
+        keys = {
+            "match_type", "days_gap", "candidate_score", "text_similarity",
+            "semantic_similarity", "recency_score", "hash_same",
+        }
+        return {key: details[key] for key in keys if key in details}
+
+    @staticmethod
+    def _refresh_case_risk(case: dict[str, Any], duplicate_check: dict[str, Any]) -> None:
+        findings = list(duplicate_check.get("findings") or [])
+        duplicate_check["risk_level"] = highest_risk(finding.get("risk_level", "normal") for finding in findings)
+        duplicate_check["summary"] = "；".join(str(finding.get("reason") or "") for finding in findings[:3])
+        triggered = [check for check in case.get("checks", []) if check.get("triggered")]
+        case["overall_risk"] = highest_risk(check.get("risk_level", "normal") for check in triggered)
 
     def _collect_candidates(self, current: Report, reports: list[Report], index_by_id: dict[str, int], matrix) -> list[dict[str, Any]]:
         self_days = int(self.daily_cfg.get("self_history_days", 30))
@@ -392,7 +556,7 @@ class DailyReportPipeline:
         if matrix is not None and current.report_id in index_by_id:
             semantic_scores = cosine_similarity(matrix[index_by_id[current.report_id]], matrix).ravel()
         eligible = []
-        for other in reports:
+        for other in self._indexed_candidate_reports(current, self_days, cross_days, cross_scope, reports):
             if other.report_id == current.report_id or other.status == "withdrawn":
                 continue
             if other.report_date > current.report_date:
@@ -428,6 +592,32 @@ class DailyReportPipeline:
             candidates.append({"report": other, "candidate_score": score, "text_similarity": round(seq, 4), "semantic_similarity": round(sem, 4), "recency_score": round(recency, 4), "match_type": match_type, "days_gap": gap, "hash_same": hash_same})
         candidates.sort(key=lambda x: (x["hash_same"], x["candidate_score"]), reverse=True)
         return candidates[:max_candidates]
+
+    def _indexed_candidate_reports(
+        self,
+        current: Report,
+        self_days: int,
+        cross_days: int,
+        cross_scope: str,
+        fallback_reports: list[Report],
+    ) -> list[Report]:
+        if not self._reports_by_date:
+            return fallback_reports
+        current_day = datetime.strptime(current.report_date, "%Y-%m-%d").date()
+        candidates: dict[str, Report] = {}
+        for offset in range(max(0, self_days) + 1):
+            report_date = (current_day - timedelta(days=offset)).isoformat()
+            for report in self._reports_by_user_date.get((current.owner_user_id, report_date), []):
+                candidates[report.report_id] = report
+        for offset in range(max(0, cross_days) + 1):
+            report_date = (current_day - timedelta(days=offset)).isoformat()
+            if cross_scope == "all":
+                reports_for_day = self._reports_by_date.get(report_date, [])
+            else:
+                reports_for_day = self._reports_by_department_date.get((current.department_id, report_date), [])
+            for report in reports_for_day:
+                candidates[report.report_id] = report
+        return list(candidates.values())
 
     @staticmethod
     def _candidate_details(cand: dict[str, Any]) -> dict[str, Any]:

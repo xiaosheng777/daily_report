@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 from src.core.pipeline import DailyReportPipeline, TaskCancelled, TaskPaused, TaskTerminated
@@ -25,12 +26,16 @@ def run_task(config_path: str, task_id: str, attempt_no: int) -> int:
     result_dir = Path(config["storage"]["root_dir"]) / "tasks" / task_id / f"attempt_{attempt_no}"
 
     previous_stage = ""
+    stage_started_at = time.monotonic()
 
     def progress(stage: str, current: int, total: int, message: str = "") -> None:
-        nonlocal previous_stage
+        nonlocal previous_stage, stage_started_at
         db.update_task_progress(task_id, attempt_no, stage, current, total, message)
         if stage != previous_stage:
+            if previous_stage:
+                runtime_log(db, "task", "stage_completed", f"任务完成 {previous_stage} 阶段", task_id=task_id, attempt_no=attempt_no, context={"stage": previous_stage, "duration_ms": round((time.monotonic() - stage_started_at) * 1000)})
             previous_stage = stage
+            stage_started_at = time.monotonic()
             runtime_log(db, "task", "stage_changed", message or f"任务进入 {stage} 阶段", task_id=task_id, attempt_no=attempt_no, context={"stage": stage, "current": current, "total": total})
 
     def control() -> str:

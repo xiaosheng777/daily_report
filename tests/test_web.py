@@ -160,6 +160,15 @@ def test_daily_duplicate_report_worker_count_is_exposed_and_validated():
             DailyReportHandler._validate_settings_payload({"daily_duplicate.report_worker_count": invalid})
 
 
+def test_local_worker_count_is_exposed_and_validated():
+    assert flatten_settings({"daily_duplicate": {}})["daily_duplicate.local_worker_count"] == 3
+    DailyReportHandler._validate_settings_payload({"daily_duplicate.local_worker_count": 1})
+    DailyReportHandler._validate_settings_payload({"daily_duplicate.local_worker_count": 32})
+    for invalid in (0, 33, 2.5, "many"):
+        with pytest.raises(ValueError, match="1 至 32"):
+            DailyReportHandler._validate_settings_payload({"daily_duplicate.local_worker_count": invalid})
+
+
 def test_retired_worker_count_is_not_exposed_or_copied_into_new_tasks():
     db = SimpleNamespace(get_settings=lambda defaults: defaults | {"daily_duplicate.worker_count": 7})
 

@@ -65,11 +65,15 @@ def flatten_settings(config: dict) -> dict:
     weights = dd.get("score_weights", {})
     checks = config.get("checks", {})
     llm = config.get("llm_judge", {})
+    task_runner = config.get("task_runner", {})
     tc = config.get("testcase_verification", {})
     return {
         "daily_report_submission.rollover_time": str(submission.get("rollover_time", submission.get("cutoff_time", "09:00"))),
         "automatic_daily_duplicate.enabled": bool(automatic.get("enabled", True)),
         "automatic_daily_duplicate.run_at": str(automatic.get("run_at", "12:00")),
+        "task_runner.max_concurrent_tasks": int(task_runner.get("max_concurrent_tasks", 2)),
+        "task_runner.task_timeout_seconds": int(task_runner.get("task_timeout_seconds", 21600)),
+        "daily_duplicate.local_worker_count": int(dd.get("local_worker_count", dd.get("report_worker_count", 3))),
         "daily_duplicate.report_worker_count": int(dd.get("report_worker_count", 3)),
         "daily_duplicate.llm_candidate_top_n": int(dd.get("llm_candidate_top_n", 3)),
         "daily_duplicate.llm_candidate_score_threshold": float(dd.get("llm_candidate_score_threshold", 0.72)),
@@ -87,6 +91,10 @@ def flatten_settings(config: dict) -> dict:
         "llm_judge.model": str(llm.get("model", "")),
         "llm_judge.api_key_file": str(llm.get("api_key_file", "")),
         "llm_judge.api_key_env": str(llm.get("api_key_env", "DAILY_REPORT_LLM_API_KEY")),
+        "llm_judge.global_max_concurrency": int(llm.get("global_max_concurrency", 30)),
+        "llm_judge.per_task_max_concurrency": int(llm.get("per_task_max_concurrency", 30)),
+        "llm_judge.request_timeout_seconds": int(llm.get("request_timeout_seconds", 180)),
+        "llm_judge.max_retries": int(llm.get("max_retries", 1)),
         "testcase_verification.enabled": bool(tc.get("enabled", True)),
         "testcase_verification.self_history_days": int(tc.get("self_history_days", 7)),
         "testcase_verification.self_history_high_rate": float(tc.get("self_history_high_rate", 0.50)),
@@ -985,6 +993,20 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         automatic_enabled = payload.get("automatic_daily_duplicate.enabled")
         if automatic_enabled is not None and not isinstance(automatic_enabled, bool):
             raise ValueError("自动查重任务开关必须为 true 或 false")
+        task_limits = {
+            "task_runner.max_concurrent_tasks": (1, 8, "任务并发数须为 1 至 8 的整数"),
+            "task_runner.task_timeout_seconds": (600, 86400, "任务超时须为 600 至 86400 秒的整数"),
+        }
+        for key, (minimum, maximum, message) in task_limits.items():
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(message)
+            if str(value).strip() != str(number) or not minimum <= number <= maximum:
+                raise ValueError(message)
         worker_count = payload.get("daily_duplicate.report_worker_count")
         if worker_count is not None:
             try:
@@ -993,6 +1015,35 @@ class DailyReportHandler(BaseHTTPRequestHandler):
                 raise ValueError("单任务并行数须为 1 至 8 的整数")
             if str(worker_count).strip() != str(workers) or not 1 <= workers <= 8:
                 raise ValueError("单任务并行数须为 1 至 8 的整数")
+        local_worker_count = payload.get("daily_duplicate.local_worker_count")
+        if local_worker_count is not None:
+            try:
+                workers = int(local_worker_count)
+            except (TypeError, ValueError):
+                raise ValueError("本地查重并行数须为 1 至 32 的整数")
+            if str(local_worker_count).strip() != str(workers) or not 1 <= workers <= 32:
+                raise ValueError("本地查重并行数须为 1 至 32 的整数")
+        limits = {
+            "llm_judge.global_max_concurrency": (1, 64, "全局 LLM 并发须为 1 至 64 的整数"),
+            "llm_judge.per_task_max_concurrency": (1, 64, "单任务 LLM 并发须为 1 至 64 的整数"),
+            "llm_judge.request_timeout_seconds": (10, 900, "LLM 请求超时须为 10 至 900 秒的整数"),
+            "llm_judge.max_retries": (0, 2, "LLM 重试次数须为 0 至 2 的整数"),
+        }
+        values: dict[str, int] = {}
+        for key, (minimum, maximum, message) in limits.items():
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(message)
+            if str(value).strip() != str(number) or not minimum <= number <= maximum:
+                raise ValueError(message)
+            values[key] = number
+        global_limit = values.get("llm_judge.global_max_concurrency", 30)
+        if values.get("llm_judge.per_task_max_concurrency", 0) > global_limit:
+            raise ValueError("单任务 LLM 并发不能超过全局 LLM 并发")
         medium = payload.get("testcase_verification.self_history_medium_rate")
         high = payload.get("testcase_verification.self_history_high_rate")
         if medium is None and high is None:

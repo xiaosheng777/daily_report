@@ -135,3 +135,43 @@ def test_snapshot_degrades_without_collector_and_invalid_history_range(tmp_path:
         assert False, "invalid range should fail"
     except ValueError:
         pass
+
+
+def test_snapshot_maps_local_and_llm_pipeline_stages():
+    class MonitorDB:
+        def __init__(self, stage: str):
+            self.stage = stage
+
+        def resource_monitor_summary(self, _retention_days: int):
+            return {
+                "sqlite": {"size_bytes": 1},
+                "counts": {"queued": 0},
+                "active": [{"task_id": "task-1", "status": "running", "progress_stage": self.stage}],
+                "llm": {"active_count": 0, "active": [], "sample_count": 0, "error_count": 0},
+                "stage_p95_seconds": {},
+            }
+
+        def get_worker_lease(self):
+            return {"worker_id": "worker-1", "heartbeat_at": now_iso()}
+
+    config = {
+        "resource_monitor": {"enabled": False},
+        "task_runner": {"stale_heartbeat_seconds": 90},
+        "storage": {"root_dir": "__missing_resource_monitor_storage__"},
+        "llm_judge": {"enabled": True},
+    }
+
+    snapshot = build_snapshot(config, MonitorDB("local_filtering"))
+
+    assert snapshot["tasks"]["active_chain_stage"] == "local"
+    assert build_snapshot(config, MonitorDB("llm_judging"))["tasks"]["active_chain_stage"] == "llm"
+
+
+def test_worker_compose_removes_cpu_cap_and_raises_memory_limit():
+    root = Path(__file__).resolve().parents[1]
+    for compose in (root / "docker-compose.yml", root / "deploy" / "docker-compose.yml"):
+        text = compose.read_text(encoding="utf-8")
+        worker = text.split("  daily-report-worker:\n", 1)[1].split("\n  daily-report-monitor:", 1)[0]
+
+        assert "cpus:" not in worker
+        assert "mem_limit: 64g" in worker

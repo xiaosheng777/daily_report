@@ -16,6 +16,8 @@ automatic_daily_duplicate:
   catch_up_on_start: true
 
 task_runner:
+  max_concurrent_tasks: 2
+  task_timeout_seconds: 21600
   stale_heartbeat_seconds: 90
   shutdown_grace_seconds: 30
   poll_interval_seconds: 2
@@ -70,10 +72,16 @@ llm_judge:
   model: internal-model-name
   temperature: 0
   max_tokens: 1024
+  global_max_concurrency: 30
+  per_task_max_concurrency: 30
+  scheduling_policy: fair
+  request_timeout_seconds: 180
   max_retries: 1
   raw_log_path: ../storage/llm_raw_logs.jsonl
 
 daily_duplicate:
+  local_worker_count: 8
+  # Legacy fallback for task snapshots created before v2.1.
   report_worker_count: 3
   self_history_days: 30
   cross_user_days: 3

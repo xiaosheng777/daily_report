@@ -232,17 +232,20 @@ def test_creator_can_delete_queued_task_and_stop_then_delete_running_task(tmp_pa
         db.delete_task(replacement_id, director)
 
 
-def test_resumable_pipeline_skips_saved_reports_and_pauses_after_dispatched_batch():
+def test_resumable_pipeline_skips_saved_reports_and_pauses_after_continuous_queue():
     current = [Report(f"r{i}", f"u{i}", f"员工{i}", "d1", "研发部", "2026-08-11", "组长", f"任务{i}", "完整工作描述") for i in range(5)]
     pipeline = DailyReportPipeline({"daily_duplicate": {"report_worker_count": 2}}, object(), None)
     saved = []
     controls = iter(["", "pause"])
 
-    def fake_build(batch, _all, _progress, callback):
+    dispatched = []
+
+    def fake_build(queue, _all, _progress, callback, _context=None):
+        dispatched.append([report.report_id for report in queue])
         cases = [ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
                             report.department_name, report.group_id, report.group_name, report.report_date,
                             report.created_at, report.title_summary, "normal", [],
-                            [CheckResult("quality_check", False, "success", "normal", "ok")]) for report in batch]
+                            [CheckResult("quality_check", False, "success", "normal", "ok")]) for report in queue]
         for case in cases:
             callback(case.to_dict())
         return cases
@@ -252,5 +255,6 @@ def test_resumable_pipeline_skips_saved_reports_and_pauses_after_dispatched_batc
     with pytest.raises(TaskPaused):
         pipeline._build_cases_resumable(current, current, completed, lambda *_args: None, lambda case: saved.append(case["report_id"]), lambda: next(controls))
 
-    assert saved == ["r1", "r2"]
-    assert set(completed) == {"r0", "r1", "r2"}
+    assert dispatched == [["r1", "r2", "r3", "r4"]]
+    assert saved == ["r1", "r2", "r3", "r4"]
+    assert set(completed) == {"r0", "r1", "r2", "r3", "r4"}

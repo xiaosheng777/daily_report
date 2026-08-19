@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from src.llm.base import LLMJudge, LLMJudgeResult
+from src.llm.limiter import LLMPermitClient
 from src.utils.config import env_or_value
 from src.utils.dates import now_iso
 from src.utils.runtime_log import exception_trace
@@ -20,7 +21,7 @@ _RAW_LOG_LOCK = threading.Lock()
 
 
 class OpenAICompatibleJudge(LLMJudge):
-    def __init__(self, config: dict[str, Any], telemetry=None, task_id: str = "") -> None:
+    def __init__(self, config: dict[str, Any], telemetry=None, task_id: str = "", permit_client: LLMPermitClient | None = None) -> None:
         self.config = config
         self.base_url = str(config.get("base_url") or "").rstrip("/")
         self.chat_path = str(config.get("chat_path") or "/v1/chat/completions")
@@ -28,11 +29,13 @@ class OpenAICompatibleJudge(LLMJudge):
         self.model = str(config.get("model") or "")
         self.temperature = float(config.get("temperature", 0))
         self.max_retries = min(1, max(0, int(config.get("max_retries", 1))))
+        self.request_timeout_seconds = max(10, min(900, int(config.get("request_timeout_seconds", 180))))
         self.max_tokens = int(config.get("max_tokens", 1024))
         raw_log_path = str(config.get("raw_log_path") or "").strip()
         self.raw_log_path = Path(raw_log_path) if raw_log_path else None
         self.telemetry = telemetry
         self.task_id = task_id
+        self.permit_client = permit_client or LLMPermitClient(task_id, int(config.get("per_task_max_concurrency", config.get("global_max_concurrency", 30))))
 
     def judge_duplicate(self, current: dict[str, Any], matched: dict[str, Any], signals: dict[str, Any]) -> LLMJudgeResult:
         if not self.base_url:
@@ -48,7 +51,8 @@ class OpenAICompatibleJudge(LLMJudge):
             started = time.monotonic()
             self._telemetry("start", {"call_id": call_id, "task_id": self.task_id, "started_at": started_at})
             try:
-                data = self._post(payload)
+                with self.permit_client.acquire():
+                    data = self._post(payload)
                 content = self._extract_content(data)
                 parsed = self._parse_json(content)
                 duration_ms = int((time.monotonic() - started) * 1000)
@@ -71,7 +75,7 @@ class OpenAICompatibleJudge(LLMJudge):
     def _retryable(exc: Exception) -> bool:
         if isinstance(exc, urllib.error.HTTPError):
             return exc.code == 429 or 500 <= exc.code <= 599
-        return isinstance(exc, (urllib.error.URLError, ConnectionError))
+        return isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout))
 
     @staticmethod
     def _error_type(exc: Exception) -> str:
@@ -143,14 +147,22 @@ class OpenAICompatibleJudge(LLMJudge):
             "只输出合法 JSON，字段：duplicate_risk, judgement_status, confidence, decision_summary, need_human_review。"
             "duplicate_risk 只能是 high, medium, low, normal, unknown。"
         )
-        user_prompt = {"current_report": current, "matched_report": matched, "signals": signals, "instruction": "判断是否重复提交，给出简短中文理由。"}
+        user_prompt = {
+            "current_report": self._duplicate_payload(current),
+            "matched_report": self._duplicate_payload(matched),
+            "signals": signals,
+            "instruction": "判断是否重复提交，给出简短中文理由。",
+        }
         return {"model": self.model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)}], "temperature": self.temperature, "max_tokens": self.max_tokens, "response_format": {"type": "json_object"}}
+
+    @staticmethod
+    def _duplicate_payload(report: dict[str, Any]) -> dict[str, Any]:
+        return {key: report.get(key, "") for key in ("report_id", "employee_name", "report_date", "title_summary", "work_description")}
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(self.base_url + self.chat_path, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {self.api_key}"}, method="POST")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        # The duplicate-check worker owns the only time limit: a hard one-hour task timeout.
-        with opener.open(request) as response:
+        with opener.open(request, timeout=self.request_timeout_seconds) as response:
             return json.load(response)
 
     @staticmethod

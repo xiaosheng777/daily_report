@@ -1027,7 +1027,7 @@ class DailyReportHandler(BaseHTTPRequestHandler):
             "llm_judge.global_max_concurrency": (1, 64, "全局 LLM 并发须为 1 至 64 的整数"),
             "llm_judge.per_task_max_concurrency": (1, 64, "单任务 LLM 并发须为 1 至 64 的整数"),
             "llm_judge.request_timeout_seconds": (10, 900, "LLM 请求超时须为 10 至 900 秒的整数"),
-            "llm_judge.max_retries": (0, 2, "LLM 重试次数须为 0 至 2 的整数"),
+            "llm_judge.max_retries": (0, 1, "LLM 重试次数须为 0 至 1 的整数"),
         }
         values: dict[str, int] = {}
         for key, (minimum, maximum, message) in limits.items():

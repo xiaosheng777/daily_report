@@ -47,24 +47,50 @@ class OpenAICompatibleJudge(LLMJudge):
         for attempt in range(self.max_retries + 1):
             content = ""
             call_id = uuid.uuid4().hex
-            started_at = now_iso()
-            started = time.monotonic()
-            self._telemetry("start", {"call_id": call_id, "task_id": self.task_id, "started_at": started_at})
+            queued_at = now_iso()
+            queued_started = time.monotonic()
+            self._telemetry("queued", {"call_id": call_id, "task_id": self.task_id, "queued_at": queued_at, "permit_snapshot": self.permit_client.snapshot()})
+            http_started = 0.0
+            http_finished = False
+            permit_wait_ms = 0
             try:
                 with self.permit_client.acquire():
+                    http_started = time.monotonic()
+                    permit_wait_ms = int((http_started - queued_started) * 1000)
+                    self._telemetry("permit_acquired", {
+                        "call_id": call_id, "task_id": self.task_id, "permit_wait_ms": permit_wait_ms,
+                        "permit_snapshot": self.permit_client.snapshot(),
+                    })
+                    self._telemetry("http_start", {
+                        "call_id": call_id, "task_id": self.task_id, "started_at": now_iso(),
+                        "permit_wait_ms": permit_wait_ms, "permit_snapshot": self.permit_client.snapshot(),
+                    })
                     data = self._post(payload)
+                    http_duration_ms = int((time.monotonic() - http_started) * 1000)
+                    http_finished = True
+                total_duration_ms = int((time.monotonic() - queued_started) * 1000)
+                self._telemetry("http_finish", {
+                    "call_id": call_id, "finished_at": now_iso(), "http_duration_ms": http_duration_ms,
+                    "total_duration_ms": total_duration_ms, "permit_wait_ms": permit_wait_ms, "ok": True,
+                    "error_type": "", "permit_snapshot": self.permit_client.snapshot(),
+                })
                 content = self._extract_content(data)
                 parsed = self._parse_json(content)
-                duration_ms = int((time.monotonic() - started) * 1000)
-                self._telemetry("finish", {"call_id": call_id, "finished_at": now_iso(), "duration_ms": duration_ms, "ok": True, "error_type": ""})
-                self._log(current, matched, attempt + 1, content, True, "", duration_ms)
+                self._log(current, matched, attempt + 1, content, True, "", total_duration_ms)
                 return self._to_result(parsed)
             except Exception as exc:
                 last_error = str(exc)
-                duration_ms = int((time.monotonic() - started) * 1000)
+                total_duration_ms = int((time.monotonic() - queued_started) * 1000)
                 error_type = self._error_type(exc)
-                self._telemetry("finish", {"call_id": call_id, "finished_at": now_iso(), "duration_ms": duration_ms, "ok": False, "error_type": error_type, "traceback": exception_trace(exc)})
-                self._log(current, matched, attempt + 1, content, False, last_error, duration_ms)
+                if http_started and not http_finished:
+                    self._telemetry("http_finish", {
+                        "call_id": call_id, "finished_at": now_iso(),
+                        "http_duration_ms": int((time.monotonic() - http_started) * 1000),
+                        "total_duration_ms": total_duration_ms, "permit_wait_ms": permit_wait_ms, "ok": False,
+                        "error_type": error_type, "traceback": exception_trace(exc),
+                        "permit_snapshot": self.permit_client.snapshot(),
+                    })
+                self._log(current, matched, attempt + 1, content, False, last_error, total_duration_ms)
                 if attempt < self.max_retries and self._retryable(exc):
                     time.sleep(min(2 ** attempt, 4))
                 else:

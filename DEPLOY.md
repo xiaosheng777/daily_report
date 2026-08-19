@@ -213,9 +213,9 @@ resource_monitor:
     - daily-report-monitor
 ```
 
-自动任务由独立 `daily-report-worker` 容器入队并执行，无需额外配置系统 cron。数据库租约保证同一存储上只有一个 worker 执行重型任务；不要绕过资源限制直接在 backend 容器内运行 worker。
+自动任务由独立 `daily-report-worker` 容器入队并执行，无需额外配置系统 cron。数据库租约保证同一存储上只有一个 Worker Supervisor；Supervisor 可按 `task_runner.max_concurrent_tasks` 并发启动隔离的任务子进程，不要在 backend 容器内直接运行 worker。
 
-查重任务只有一个时间限制：从任务子进程启动起满 60 分钟仍未结束，worker 会终止该进程并将任务标记为失败。LLM 单次请求不设独立超时，也没有 45 分钟停止新增调用的截止线。
+查重任务的最终时限由 `task_runner.task_timeout_seconds` 控制（默认 21600 秒）；超时后 worker 会终止该子进程并标记失败。LLM 单次 HTTP 请求时限由 `llm_judge.request_timeout_seconds` 控制（默认 180 秒）。
 
 模型配置：
 
@@ -228,6 +228,9 @@ llm_judge:
   model: 你的模型名
   api_key_file: config/llm_api_key
   api_key_env: DAILY_REPORT_LLM_API_KEY
+  global_max_concurrency: 30 # 全部 Task 实际 HTTP 请求的共享上限，可热更新
+  per_task_max_concurrency: 30
+  request_timeout_seconds: 180
   max_retries: 1 # 单次调用遇到可重试错误时最多补试一次；不会熔断后续候选
 ```
 
@@ -237,7 +240,7 @@ llm_judge:
 
 ```yaml
 daily_duplicate:
-  report_worker_count: 3 # 不同日报的查重并行数，范围 1-8；结果仍按日报原顺序输出
+  local_worker_count: 8 # 本地候选生成并行数，范围 1-32；每份完成即 checkpoint
   llm_candidate_top_n: 3
   llm_candidate_score_threshold: 0.72
   low_info_candidate_score_threshold: 0.82
@@ -331,7 +334,7 @@ docker run -d \
 
 监控侧车不发布宿主机端口，代码只调用固定的 Docker GET 接口，也不会重启或停止容器。需要注意：Unix socket 的 `:ro` 只能防止替换 socket 文件，不能在 Docker API 层阻止写操作；获得该 socket 的容器仍具有很高的宿主机权限。不要为监控侧车增加公网端口或安装额外服务，容器白名单也应只填写确实需要观察的服务。
 
-以上配置按 16 GB 宿主机规划：查重 worker 保持 2 CPU，并设置 8 GB 内存硬上限；backend 和 nginx 不额外设置内存上限。大型任务运行时可通过 `docker stats daily-report-worker` 观察峰值，并用 `docker inspect daily-report-worker --format '{{.State.OOMKilled}}'` 检查是否发生 OOM。若峰值长期接近 8 GB，应先评估任务规模和并行内存占用，再考虑提高到 10–12 GB；16 GB 宿主机不建议取消上限。
+查重 worker 不设置 CPU 硬上限；本地并行度由 `daily_duplicate.local_worker_count` 控制，并设置 64 GB 内存硬上限。大型任务运行时可通过 `docker stats daily-report-worker` 观察峰值，并用 `docker inspect daily-report-worker --format '{{.State.OOMKilled}}'` 检查是否发生 OOM。部署主机须具备足够可用内存，或应相应降低 `local_worker_count` 和 `max_concurrent_tasks`。
 
 访问：
 

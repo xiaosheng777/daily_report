@@ -62,70 +62,102 @@ def test_daily_duplicate_checks_run_in_bounded_pool_and_keep_report_order(monkey
     assert completed[:3] != ["r0", "r1", "r2"]
     assert [case.report_id for case in cases] == [f"r{index}" for index in range(7)]
     assert [case.checks[1].summary for case in cases] == [f"r{index}" for index in range(7)]
-    assert emitted == [f"r{index}" for index in range(7)]
+    # Checkpoints are intentionally persisted as local workers complete; final
+    # task output remains in original report order.
+    assert sorted(emitted) == [f"r{index}" for index in range(7)]
+    assert emitted != [f"r{index}" for index in range(7)]
 
 
 def test_report_worker_count_defaults_to_three_and_is_capped_at_eight(monkeypatch):
-    worker_counts = []
-
-    class CapturingExecutor:
-        def __init__(self, max_workers, **_kwargs):
-            worker_counts.append(max_workers)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, callback, items):
-            return map(callback, items)
-
-    monkeypatch.setattr("src.core.pipeline.ThreadPoolExecutor", CapturingExecutor)
-
-    for daily_cfg in ({}, {"report_worker_count": 99}):
+    for daily_cfg, expected in (({}, 3), ({"report_worker_count": 99}, 8)):
         pipeline = DailyReportPipeline(
             {"daily_duplicate": daily_cfg, "checks": {"enable_code_check": False, "enable_document_check": False}},
             SimpleNamespace(),
             None,
         )
-        monkeypatch.setattr(
-            pipeline,
-            "_daily_duplicate_check",
-            lambda report, *_args: CheckResult("report_duplicate_check", True, "success", "normal", report.report_id),
-        )
-        pipeline._build_cases(reports(10), reports(10))
-
-    assert worker_counts == [3, 8]
+        assert pipeline._local_worker_count() == expected
 
 
 def test_local_worker_count_overrides_legacy_worker_count_and_is_capped_at_thirty_two(monkeypatch):
-    worker_counts = []
-
-    class CapturingExecutor:
-        def __init__(self, max_workers, **_kwargs):
-            worker_counts.append(max_workers)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, callback, items):
-            return map(callback, items)
-
-    monkeypatch.setattr("src.core.pipeline.ThreadPoolExecutor", CapturingExecutor)
-    for daily_cfg in ({"local_worker_count": 99, "report_worker_count": 1}, {"local_worker_count": 12, "report_worker_count": 1}):
+    for daily_cfg, expected in (({"local_worker_count": 99, "report_worker_count": 1}, 32), ({"local_worker_count": 12, "report_worker_count": 1}, 12)):
         pipeline = DailyReportPipeline(
             {"daily_duplicate": daily_cfg, "checks": {"enable_code_check": False, "enable_document_check": False}},
             SimpleNamespace(),
             None,
         )
-        monkeypatch.setattr(pipeline, "_daily_duplicate_check", lambda report, *_args: CheckResult("report_duplicate_check", True, "success", "normal", report.report_id))
-        pipeline._build_cases(reports(40), reports(40))
+        assert pipeline._local_worker_count() == expected
 
-    assert worker_counts == [32, 12]
+
+def test_local_checkpoint_survives_mid_phase_crash(monkeypatch):
+    source = reports(5)
+
+    class FakeDatabase:
+        def list_reports(self, *_args, **_kwargs):
+            return source
+
+        @staticmethod
+        def list_required_submitters(_user):
+            return []
+
+    calls, checkpoints = [], []
+    pipeline = DailyReportPipeline(
+        {"daily_duplicate": {"local_worker_count": 1}, "checks": {"enable_code_check": False, "enable_document_check": False}},
+        FakeDatabase(), None,
+    )
+    monkeypatch.setattr(pipeline, "_daily_duplicate_check", lambda report, *_args: (calls.append(report.report_id), CheckResult("report_duplicate_check", True, "success", "normal", report.report_id))[1])
+
+    def persist_then_crash(case):
+        checkpoints.append(copy.deepcopy(case))
+        if len(checkpoints) == 2:
+            raise RuntimeError("simulated task process crash")
+
+    with pytest.raises(RuntimeError, match="crash"):
+        pipeline.run(scope={"report_date_start": "2026-08-11", "report_date_end": "2026-08-11"}, case_callback=persist_then_crash)
+    assert calls == ["r0", "r1"]
+
+    resumed_calls = []
+    resumed = DailyReportPipeline(
+        {"daily_duplicate": {"local_worker_count": 1}, "checks": {"enable_code_check": False, "enable_document_check": False}},
+        FakeDatabase(), None,
+    )
+    monkeypatch.setattr(resumed, "_daily_duplicate_check", lambda report, *_args: (resumed_calls.append(report.report_id), CheckResult("report_duplicate_check", True, "success", "normal", report.report_id))[1])
+    resumed.run(scope={"report_date_start": "2026-08-11", "report_date_end": "2026-08-11"}, resume_cases=checkpoints)
+
+    assert resumed_calls == ["r2", "r3", "r4"]
+
+
+def test_pause_during_local_phase_only_drains_inflight_reports(monkeypatch):
+    source = reports(8)
+
+    class FakeDatabase:
+        def list_reports(self, *_args, **_kwargs):
+            return source
+
+        @staticmethod
+        def list_required_submitters(_user):
+            return []
+
+    calls, saved = [], []
+    pipeline = DailyReportPipeline(
+        {"daily_duplicate": {"local_worker_count": 2}, "checks": {"enable_code_check": False, "enable_document_check": False}},
+        FakeDatabase(), None,
+    )
+
+    def local_check(report, *_args):
+        calls.append(report.report_id)
+        time.sleep(.01)
+        return CheckResult("report_duplicate_check", True, "success", "normal", report.report_id)
+
+    monkeypatch.setattr(pipeline, "_daily_duplicate_check", local_check)
+    with pytest.raises(TaskPaused):
+        pipeline.run(
+            scope={"report_date_start": "2026-08-11", "report_date_end": "2026-08-11"},
+            control_callback=lambda: "pause" if len(saved) >= 3 else "",
+            case_callback=lambda case: saved.append(copy.deepcopy(case)),
+        )
+
+    assert len(saved) == len(calls)
+    assert 3 <= len(calls) <= 4
 
 
 def test_candidate_indexes_keep_the_existing_user_department_and_date_scope():
@@ -387,7 +419,9 @@ def test_pause_during_llm_phase_resumes_only_unfinished_pairs(monkeypatch):
         Judge(),
     )
     monkeypatch.setattr(pipeline, "_collect_candidates", candidates)
-    controls = iter(["", "", "", "", "pause"])
+    # Local checkpoints now poll controls too; leave local phase unpaused and
+    # pause immediately after the first LLM pair completes.
+    controls = iter([""] * 6 + ["pause"])
     with pytest.raises(TaskPaused, match="暂停"):
         pipeline.run(scope={"employee_scope": "u0"}, control_callback=lambda: next(controls), case_callback=lambda case: saved.append(copy.deepcopy(case)))
 

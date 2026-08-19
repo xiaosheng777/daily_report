@@ -16,7 +16,9 @@
 - 文件保存改为文件系统：`storage/` 存真实文件，SQLite 只存 metadata/path/hash。
 - 每次查重都是独立 task：`storage/tasks/<task_id>/` 保存 JSON、Excel、Word、metadata、error。
 - 日报主查重改为 top-N 多候选、多 finding、加权 score、跨人协作判断 prompt。
-- 人工与 12:00 自动查重进入同一个持久队列，由独立 worker 单任务串行执行；Web 服务不再承担重型查重计算。
+- 人工与 12:00 自动查重进入同一个持久队列，由独立 worker 启动隔离的 Task 子进程并发执行；并发数由 `max_concurrent_tasks` 控制，Web 服务不承担重型查重计算。
+- Local 查重每完成一份日报即持久化 checkpoint；暂停或取消会停止继续派发，仅等待有限数量的在途日报收尾。
+- 全局 LLM Permit Server 公平调度全部 Task，并区分 executor 在途、等待 Permit 与实际 HTTP 活跃请求；`global_max_concurrency` 可由 Worker 热更新。
 - top-N、阈值、权重都可在管理员页面调整。
 - 测试用例 Excel 由组长或主任上传本部门每日总表。
 - 测试用例 baseline 改为 report_date 之前最近一份部门快照。
@@ -112,6 +114,6 @@ bash deploy/scripts/pull_base_images_one_by_one.sh
 bash deploy/scripts/build_backend_image.sh
 ```
 
-推荐使用 `docker compose up -d` 启动 backend、受 2 CPU/8 GB 限制的独立 worker、nginx 和只读资源监控侧车。管理员可在“资源监控”查看容器、主机、任务队列、SQLite 与 LLM 延迟；分钟历史保留 7 天。该内存配置按 16 GB 宿主机规划，不建议直接取消 worker 内存上限。
+推荐使用 `docker compose up -d` 启动 backend、独立 worker、nginx 和只读资源监控侧车。worker 不设置 CPU 硬上限，本地并发由 `daily_duplicate.local_worker_count` 控制，内存上限为 64 GB。资源监控快照会提供容器、主机、任务队列、SQLite，以及 LLM HTTP active / Permit waiting / executor inflight 等状态；分钟历史保留 7 天。
 
 详见 `DEPLOY.md`。

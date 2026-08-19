@@ -45,13 +45,20 @@ def run_task(config_path: str, task_id: str, attempt_no: int) -> int:
         db.save_task_case(task_id, attempt_no, case)
 
     def llm_telemetry(event: str, payload: dict) -> None:
-        if event == "start":
-            db.start_llm_call(str(payload["call_id"]), task_id, str(payload["started_at"]))
-            runtime_log(db, "llm", "call_started", "开始调用大模型", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"])})
-        elif event == "finish":
-            db.finish_llm_call(str(payload["call_id"]), str(payload["finished_at"]), int(payload["duration_ms"]), bool(payload["ok"]), str(payload.get("error_type") or ""))
+        snapshot = payload.get("permit_snapshot")
+        if isinstance(snapshot, dict):
+            db.update_llm_permit_metrics(snapshot)
+        if event == "queued":
+            runtime_log(db, "llm", "call_queued", "大模型调用正在等待并发许可", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"])})
+        elif event == "permit_acquired":
+            runtime_log(db, "llm", "permit_acquired", "大模型调用已获得并发许可", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"]), "permit_wait_ms": int(payload.get("permit_wait_ms") or 0)})
+        elif event == "http_start":
+            db.start_llm_call(str(payload["call_id"]), task_id, str(payload["started_at"]), int(payload.get("permit_wait_ms") or 0))
+            runtime_log(db, "llm", "http_started", "开始发送大模型 HTTP 请求", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"]), "permit_wait_ms": int(payload.get("permit_wait_ms") or 0)})
+        elif event == "http_finish":
+            db.finish_llm_call(str(payload["call_id"]), str(payload["finished_at"]), int(payload.get("http_duration_ms") or 0), bool(payload["ok"]), str(payload.get("error_type") or ""), int(payload.get("total_duration_ms") or 0))
             ok = bool(payload["ok"])
-            runtime_log(db, "llm", "call_finished" if ok else "call_failed", "大模型调用完成" if ok else "大模型调用失败", level="info" if ok else "error", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"]), "duration_ms": int(payload["duration_ms"]), "error_type": str(payload.get("error_type") or "")}, traceback_text=str(payload.get("traceback") or ""))
+            runtime_log(db, "llm", "http_finished" if ok else "http_failed", "大模型 HTTP 请求完成" if ok else "大模型 HTTP 请求失败", level="info" if ok else "error", task_id=task_id, attempt_no=attempt_no, context={"call_id": str(payload["call_id"]), "http_duration_ms": int(payload.get("http_duration_ms") or 0), "permit_wait_ms": int(payload.get("permit_wait_ms") or 0), "total_duration_ms": int(payload.get("total_duration_ms") or 0), "error_type": str(payload.get("error_type") or "")}, traceback_text=str(payload.get("traceback") or ""))
 
     try:
         runtime_log(db, "task", "started", "查重任务开始执行", task_id=task_id, attempt_no=attempt_no, context={"trigger_source": str(task.get("trigger_source") or "")})

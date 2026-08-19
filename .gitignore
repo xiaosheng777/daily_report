@@ -33,3 +33,6 @@ storage/**
 
 # Downloaded/offline binary dependencies (keep their README files tracked)
 *.tar
+
+# Generated offline release bundles
+dist/

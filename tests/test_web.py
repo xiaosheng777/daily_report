@@ -169,6 +169,13 @@ def test_local_worker_count_is_exposed_and_validated():
             DailyReportHandler._validate_settings_payload({"daily_duplicate.local_worker_count": invalid})
 
 
+def test_llm_retry_setting_matches_the_supported_implementation():
+    DailyReportHandler._validate_settings_payload({"llm_judge.max_retries": 0})
+    DailyReportHandler._validate_settings_payload({"llm_judge.max_retries": 1})
+    with pytest.raises(ValueError, match="0 至 1"):
+        DailyReportHandler._validate_settings_payload({"llm_judge.max_retries": 2})
+
+
 def test_retired_worker_count_is_not_exposed_or_copied_into_new_tasks():
     db = SimpleNamespace(get_settings=lambda defaults: defaults | {"daily_duplicate.worker_count": 7})
 

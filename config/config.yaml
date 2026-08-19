@@ -74,7 +74,6 @@ llm_judge:
   max_tokens: 1024
   global_max_concurrency: 30
   per_task_max_concurrency: 30
-  scheduling_policy: fair
   request_timeout_seconds: 180
   max_retries: 1
   raw_log_path: ../storage/llm_raw_logs.jsonl

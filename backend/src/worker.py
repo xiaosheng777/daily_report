@@ -114,13 +114,19 @@ class DuplicateWorker:
         defaults = {
             "task_runner.max_concurrent_tasks": self.max_concurrent_tasks,
             "task_runner.task_timeout_seconds": self.timeout_seconds,
+            "llm_judge.global_max_concurrency": self.llm_permits.snapshot()["global_limit"],
         }
         try:
             stored = get_settings(defaults)
             self.max_concurrent_tasks = max(1, min(8, int(stored.get("task_runner.max_concurrent_tasks", self.max_concurrent_tasks))))
             self.timeout_seconds = max(600, min(86400, int(stored.get("task_runner.task_timeout_seconds", self.timeout_seconds))))
+            self.llm_permits.resize(max(1, min(64, int(stored.get("llm_judge.global_max_concurrency", self.llm_permits.snapshot()["global_limit"])))))
         except (TypeError, ValueError):
             return
+        # Persist the supervisor's own view, not an inference from task-process
+        # call rows.  This also clears HTTP active after a killed child closes its
+        # permit IPC connection without emitting a final telemetry event.
+        self.db.update_llm_permit_metrics(self.llm_permits.snapshot())
 
     def _supervise_running_tasks(self) -> None:
         for task_id, running in list(self.running_tasks.items()):

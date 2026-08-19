@@ -55,6 +55,27 @@ class _FairPermitPool:
                     self._active_by_task[task_id] = active - 1
             self._dispatch_locked()
 
+    def resize(self, global_limit: int) -> None:
+        """Update the limit without revoking permits already granted."""
+        with self._lock:
+            self.global_limit = max(1, int(global_limit))
+            self._dispatch_locked()
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            waiting_by_task = {
+                task_id: len(queue)
+                for task_id, queue in self._waiting.items()
+                if queue
+            }
+            return {
+                "global_limit": self.global_limit,
+                "active_total": self._active_total,
+                "waiting_total": sum(waiting_by_task.values()),
+                "active_by_task": dict(self._active_by_task),
+                "waiting_by_task": waiting_by_task,
+            }
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -139,6 +160,12 @@ class GlobalLLMPermitServer:
             self._thread.join(timeout=2)
             self._thread = None
 
+    def resize(self, global_limit: int) -> None:
+        self.pool.resize(global_limit)
+
+    def snapshot(self) -> dict[str, object]:
+        return self.pool.snapshot()
+
     def _accept_loop(self) -> None:
         while self._running and self._listener:
             try:
@@ -154,7 +181,14 @@ class GlobalLLMPermitServer:
             self._connections.add(connection)
         try:
             request = connection.recv()
-            if not isinstance(request, dict) or request.get("op") != "acquire":
+            if not isinstance(request, dict):
+                connection.send({"ok": False, "error": "invalid permit request"})
+                return
+            operation = request.get("op")
+            if operation == "stats":
+                connection.send({"ok": True, "snapshot": self.snapshot()})
+                return
+            if operation != "acquire":
                 connection.send({"ok": False, "error": "invalid permit request"})
                 return
             task_id = str(request.get("task_id") or "unknown")
@@ -232,3 +266,21 @@ class LLMPermitClient:
         except Exception:
             connection.close()
             raise
+
+    def snapshot(self) -> dict[str, object] | None:
+        """Return authoritative server counters when a supervisor is available."""
+        if not self._address:
+            return None
+        connection: Connection | None = None
+        try:
+            connection = Client(self._address, authkey=self._authkey)
+            connection.send({"op": "stats"})
+            reply = connection.recv()
+            if isinstance(reply, dict) and reply.get("ok") and isinstance(reply.get("snapshot"), dict):
+                return reply["snapshot"]
+            return None
+        except Exception:
+            return None
+        finally:
+            if connection:
+                connection.close()

@@ -164,10 +164,16 @@ class DailyReportPipeline:
         def queue_progress(_stage: str, current: int, _queue_total: int, message: str = "") -> None:
             progress("local_filtering", min(total, completed_count + current), total, message)
 
-        # Submit the whole remaining queue to the bounded executor.  In contrast to
-        # the old fixed-size batches, each worker immediately receives another
-        # report when it finishes, so a slow report cannot idle the other workers.
-        cases = self._build_cases(remaining, all_reports, queue_progress, case_callback, duplicate_context)
+        # `_build_cases` checkpoints each completed report before it accepts the
+        # next one.  Keep the control callback on the pipeline rather than adding
+        # another public/private method argument: a few integrations override the
+        # existing helper when testing a task snapshot.
+        previous_control = getattr(self, "_local_control", None)
+        self._local_control = control
+        try:
+            cases = self._build_cases(remaining, all_reports, queue_progress, case_callback, duplicate_context)
+        finally:
+            self._local_control = previous_control
         for case in cases:
             completed[case.report_id] = case.to_dict()
         completed_count += len(cases)
@@ -260,35 +266,84 @@ class DailyReportPipeline:
     ) -> list[ReviewCase]:
         progress = progress_callback or (lambda _stage, _current, _total, _message="": None)
         index_by_id, matrix = duplicate_context or self._prepare_duplicate_context(all_reports)
-        duplicate_checks = self._run_daily_duplicate_checks(current_reports, all_reports, index_by_id, matrix)
         group_extras_cache: dict[tuple[str, str], list[Finding]] = {}
-        cases: list[ReviewCase] = []
+        cases_by_report_id: dict[str, ReviewCase] = {}
         total = len(current_reports)
-        for position, (report, duplicate_check) in enumerate(zip(current_reports, duplicate_checks), 1):
-            progress("checking", position - 1, total, f"正在检查第 {position}/{total} 份日报")
+        if not current_reports:
+            return []
+        control = getattr(self, "_local_control", None) or (lambda: "")
+        self._raise_for_control(control())
+        worker_count = min(total, self._local_worker_count())
+
+        def check(report: Report) -> CheckResult:
+            return self._safe_check(
+                "report_duplicate_check",
+                report,
+                lambda: self._daily_duplicate_check(report, all_reports, index_by_id, matrix),
+            )
+
+        def build_case(report: Report, duplicate_check: CheckResult) -> ReviewCase:
             checks: list[CheckResult] = [
                 self._quality_check(report),
                 duplicate_check,
-                self._safe_check("testcase_check", report, lambda report=report: self._testcase_check(report, all_reports, group_extras_cache)),
+                self._safe_check("testcase_check", report, lambda: self._testcase_check(report, all_reports, group_extras_cache)),
             ]
             if self.checks.get("enable_code_check", True):
-                code = self._safe_check("code_check", report, lambda report=report: self._code_token_check(report))
+                code = self._safe_check("code_check", report, lambda: self._code_token_check(report))
                 if code.triggered:
                     checks.append(code)
             if self.checks.get("enable_document_check", True):
-                doc = self._safe_check("document_check", report, lambda report=report: self._document_token_check(report))
+                doc = self._safe_check("document_check", report, lambda: self._document_token_check(report))
                 if doc.triggered:
                     checks.append(doc)
-            triggered = [c.checker_id for c in checks if c.triggered]
-            risk = highest_risk(c.risk_level for c in checks if c.triggered) if triggered else "normal"
-            case = ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
+            triggered = [item.checker_id for item in checks if item.triggered]
+            risk = highest_risk(item.risk_level for item in checks if item.triggered) if triggered else "normal"
+            return ReviewCase(report.report_id, report.employee_name, report.owner_user_id, report.department_id,
                               report.department_name, report.group_id, report.group_name, report.report_date,
                               report.created_at, report.title_summary, risk, triggered, checks)
-            cases.append(case)
-            if case_callback:
-                case_callback(case.to_dict())
-            progress("checking", position, total, f"已完成 {position}/{total} 份日报")
-        return cases
+
+        # Keep only `local_worker_count` reports in flight.  This makes a pause or
+        # cancellation bounded: completed work is persisted immediately, no large
+        # pre-submitted queue keeps running after the control request.
+        reports = iter(current_reports)
+        futures: dict[Any, Report] = {}
+        completed = 0
+        stop_action = ""
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="daily-duplicate-report") as executor:
+            def submit_available() -> None:
+                while not stop_action and len(futures) < worker_count:
+                    try:
+                        report = next(reports)
+                    except StopIteration:
+                        return
+                    futures[executor.submit(check, report)] = report
+
+            submit_available()
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    report = futures.pop(future)
+                    case = build_case(report, future.result())
+                    # This is the Local checkpoint.  It intentionally occurs in
+                    # completion order; the returned task payload is reordered
+                    # below to preserve the caller's original report order.
+                    if case_callback:
+                        case_callback(case.to_dict())
+                    cases_by_report_id[report.report_id] = case
+                    completed += 1
+                    progress("checking", completed, total, f"本地筛选已完成 {completed}/{total} 份日报")
+                    stop_action = stop_action or control()
+                if stop_action == "terminate":
+                    # Cancel work that has not started.  The supervisor retains
+                    # its existing force-kill behaviour for running threads.
+                    for future in futures:
+                        future.cancel()
+                    raise TaskTerminated("任务已强制终止")
+                submit_available()
+
+        self._raise_for_control(stop_action)
+        return [cases_by_report_id[report.report_id] for report in current_reports]
 
     def _prepare_duplicate_context(self, reports: list[Report]) -> tuple[dict[str, int], Any]:
         """Build the immutable duplicate-check data once for the current task."""
@@ -309,28 +364,6 @@ class DailyReportPipeline:
         except Exception:
             matrix = None
         return {report.report_id: index for index, report in enumerate(reports)}, matrix
-
-    def _run_daily_duplicate_checks(
-        self,
-        current_reports: list[Report],
-        all_reports: list[Report],
-        index_by_id: dict[str, int],
-        matrix,
-    ) -> list[CheckResult]:
-        if not current_reports:
-            return []
-        worker_count = min(len(current_reports), self._local_worker_count())
-
-        def check(report: Report) -> CheckResult:
-            return self._safe_check(
-                "report_duplicate_check",
-                report,
-                lambda: self._daily_duplicate_check(report, all_reports, index_by_id, matrix),
-            )
-
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="daily-duplicate-report") as executor:
-            # executor.map yields in input order even when individual reports finish out of order.
-            return list(executor.map(check, current_reports))
 
     def _local_worker_count(self) -> int:
         if "local_worker_count" in self.daily_cfg:

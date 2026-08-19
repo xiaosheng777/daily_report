@@ -47,6 +47,26 @@ def test_stale_running_task_fails_and_keeps_partial_results(tmp_path):
     assert [case["report_id"] for case in task["result"]["report_cases"]] == ["r1"]
 
 
+def test_retry_of_interrupted_task_reuses_local_checkpoints(tmp_path):
+    db = build_org(tmp_path)
+    leader = as_user(db, "leader1")
+    task_id = db.create_task(leader, {}, {}, "pending")
+    claimed = db.claim_next_task("worker-1", "lease-1")
+    db.save_task_case(task_id, claimed["current_attempt"], {
+        "report_id": "r1", "owner_user_id": leader.user_id, "department_id": leader.department_id,
+        "group_id": leader.group_id, "overall_risk": "normal",
+    })
+    db.finish_task(task_id, "failed", {}, "process died", "worker_process_exit", claimed["current_attempt"])
+
+    assert db.retry_task(task_id, leader) is True
+    resumed = db.get_task(task_id, leader)
+    assert resumed["current_attempt"] == claimed["current_attempt"]
+    assert resumed["resume_from_checkpoint"] == 1
+    claimed_again = db.claim_next_task("worker-1", "lease-2")
+    assert [case["report_id"] for case in db.get_task(task_id, leader)["result"]["report_cases"]] == ["r1"]
+    assert claimed_again["current_attempt"] == claimed["current_attempt"]
+
+
 def test_scoped_task_summary_counts_llm_reviews_and_local_degradation(tmp_path):
     db = build_org(tmp_path)
     leader = as_user(db, "leader1")

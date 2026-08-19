@@ -127,7 +127,13 @@ class SQLiteBackend(DatabaseBackend):
             );
             create table if not exists llm_call_metrics (
               call_id text primary key, task_id text default '', started_at text not null, finished_at text default '',
-              duration_ms integer not null default 0, ok integer, error_type text default ''
+              duration_ms integer not null default 0, total_duration_ms integer not null default 0,
+              permit_wait_ms integer not null default 0, ok integer, error_type text default ''
+            );
+            create table if not exists llm_permit_metrics (
+              singleton integer primary key check(singleton=1), updated_at text not null, global_limit integer not null,
+              active_total integer not null, waiting_total integer not null, active_by_task_json text not null default '{}',
+              waiting_by_task_json text not null default '{}'
             );
             create table if not exists task_stage_metrics (
               task_id text not null, attempt_no integer not null, stage text not null, started_at text not null,
@@ -200,6 +206,8 @@ class SQLiteBackend(DatabaseBackend):
                 "alter table check_tasks add column delete_requested integer not null default 0",
                 "alter table testcase_snapshots add column group_id text default ''",
                 "alter table testcase_snapshots add column group_name text default ''",
+                "alter table llm_call_metrics add column total_duration_ms integer not null default 0",
+                "alter table llm_call_metrics add column permit_wait_ms integer not null default 0",
             ]:
                 try:
                     db.execute(stmt)
@@ -932,15 +940,26 @@ class SQLiteBackend(DatabaseBackend):
             row = db.execute("select worker_id,heartbeat_at from worker_leases where lease_name='duplicate-worker'").fetchone()
         return dict(row) if row else None
 
-    def start_llm_call(self, call_id: str, task_id: str, started_at: str) -> None:
+    def start_llm_call(self, call_id: str, task_id: str, started_at: str, permit_wait_ms: int = 0) -> None:
         with self.connect() as db:
-            db.execute("insert or replace into llm_call_metrics(call_id,task_id,started_at,finished_at,duration_ms,ok,error_type) values (?,?,?,'',0,null,'')",
-                (call_id, task_id, started_at))
+            db.execute("""insert or replace into llm_call_metrics(call_id,task_id,started_at,finished_at,duration_ms,total_duration_ms,permit_wait_ms,ok,error_type)
+                values (?,?,?,'',0,0,?,null,'')""", (call_id, task_id, started_at, max(0, int(permit_wait_ms))))
 
-    def finish_llm_call(self, call_id: str, finished_at: str, duration_ms: int, ok: bool, error_type: str = "") -> None:
+    def finish_llm_call(self, call_id: str, finished_at: str, duration_ms: int, ok: bool, error_type: str = "", total_duration_ms: int = 0) -> None:
         with self.connect() as db:
-            db.execute("update llm_call_metrics set finished_at=?,duration_ms=?,ok=?,error_type=? where call_id=?",
-                (finished_at, max(0, int(duration_ms)), 1 if ok else 0, str(error_type or "")[:80], call_id))
+            db.execute("update llm_call_metrics set finished_at=?,duration_ms=?,total_duration_ms=?,ok=?,error_type=? where call_id=?",
+                (finished_at, max(0, int(duration_ms)), max(0, int(total_duration_ms)), 1 if ok else 0, str(error_type or "")[:80], call_id))
+
+    def update_llm_permit_metrics(self, snapshot: dict[str, Any]) -> None:
+        with self.connect() as db:
+            db.execute("""insert into llm_permit_metrics(singleton,updated_at,global_limit,active_total,waiting_total,active_by_task_json,waiting_by_task_json)
+                values (1,?,?,?,?,?,?) on conflict(singleton) do update set updated_at=excluded.updated_at,global_limit=excluded.global_limit,
+                active_total=excluded.active_total,waiting_total=excluded.waiting_total,active_by_task_json=excluded.active_by_task_json,
+                waiting_by_task_json=excluded.waiting_by_task_json""", (
+                now_iso(), max(1, int(snapshot.get("global_limit") or 1)), max(0, int(snapshot.get("active_total") or 0)),
+                max(0, int(snapshot.get("waiting_total") or 0)), json.dumps(snapshot.get("active_by_task") or {}, ensure_ascii=False),
+                json.dumps(snapshot.get("waiting_by_task") or {}, ensure_ascii=False),
+            ))
 
     def resource_monitor_summary(self, retention_days: int = 7) -> dict[str, Any]:
         cutoff = (datetime.fromisoformat(now_iso()) - timedelta(days=max(1, min(30, int(retention_days))))).isoformat()
@@ -955,8 +974,9 @@ class SQLiteBackend(DatabaseBackend):
                 where status in ('queued','running','paused') order by priority desc,queued_at,created_at""").fetchall()
             recent_rows = db.execute("""select started_at,finished_at,status from check_tasks
                 where started_at!='' and finished_at!='' and finished_at>=? order by finished_at desc limit 500""", (cutoff,)).fetchall()
-            llm_rows = db.execute("""select call_id,task_id,started_at,finished_at,duration_ms,ok,error_type
+            llm_rows = db.execute("""select call_id,task_id,started_at,finished_at,duration_ms,total_duration_ms,permit_wait_ms,ok,error_type
                 from llm_call_metrics where started_at>=? order by started_at desc limit 2000""", (cutoff,)).fetchall()
+            permit_row = db.execute("select * from llm_permit_metrics where singleton=1").fetchone()
             stage_rows = db.execute("select stage,duration_seconds from task_stage_metrics where finished_at>=? order by finished_at desc limit 5000", (cutoff,)).fetchall()
             db.execute("delete from llm_call_metrics where started_at<?", (cutoff,))
             db.execute("delete from task_stage_metrics where finished_at<?", (cutoff,))
@@ -996,6 +1016,12 @@ class SQLiteBackend(DatabaseBackend):
         for row in stage_rows:
             stage_values.setdefault(str(row["stage"] or "unknown"), []).append(int(row["duration_seconds"] or 0))
         stage_p95 = {stage: percentile(sorted(values), .95) for stage, values in stage_values.items()}
+        permit = dict(permit_row) if permit_row else {}
+        if permit:
+            permit["active_by_task"] = json.loads(permit.pop("active_by_task_json", "{}") or "{}")
+            permit["waiting_by_task"] = json.loads(permit.pop("waiting_by_task_json", "{}") or "{}")
+        http_active = int(permit.get("active_total", len(active_llm)))
+        waiting_for_permit = int(permit.get("waiting_total", 0))
         return {
             "counts": {"running": counts.get("running", 0), "queued": counts.get("queued", 0), "paused": counts.get("paused", 0), "failed": counts.get("failed", 0), "terminated": counts.get("terminated", 0)},
             "active": tasks,
@@ -1004,7 +1030,13 @@ class SQLiteBackend(DatabaseBackend):
             "stage_p95_seconds": stage_p95,
             "sqlite": {"latency_ms": sqlite_latency_ms, "size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0},
             "llm": {
-                "active_count": len(active_llm), "active": active_llm,
+                # Call rows begin only when HTTP begins; the Permit Server
+                # snapshot remains the authoritative current-concurrency view.
+                "active_count": http_active, "http_active": http_active,
+                "waiting_for_permit": waiting_for_permit,
+                "executor_inflight": http_active + waiting_for_permit,
+                "active": active_llm,
+                "permit": permit,
                 "sample_count": len(finished_llm),
                 "success_count": sum(1 for row in finished_llm if row["ok"] == 1),
                 "error_count": sum(1 for row in finished_llm if row["ok"] == 0),
@@ -1124,6 +1156,16 @@ class SQLiteBackend(DatabaseBackend):
                 raise ValueError("task not found or forbidden")
             if task["status"] not in {"failed", "cancelled"}:
                 return False
+            # A crashed process may already have durable Local checkpoints in its
+            # current attempt.  Requeue that same attempt so task_job can pass
+            # them back to the pipeline; a normal retry without checkpoints
+            # keeps the previous fresh-attempt behaviour.
+            if task["status"] == "failed" and int(task["partial_available"] or 0):
+                changed = db.execute("""update check_tasks set status='queued',queued_at=?,heartbeat_at='',worker_id='',lease_token='',
+                    progress_stage='queued',progress_message='等待后台 worker 从检查点恢复',cancel_requested=0,
+                    pause_requested=0,force_terminate_requested=0,resume_from_checkpoint=1,failure_type='',error_message='',finished_at=''
+                    where task_id=? and status='failed'""", (now_iso(), task_id)).rowcount
+                return bool(changed)
             attempt = int(task["current_attempt"] or 1) + 1
             changed = db.execute("""update check_tasks set status='queued',priority=case when trigger_source='system_daily' then 100 else 0 end,
                 queued_at=?,started_at='',heartbeat_at='',worker_id='',lease_token='',progress_stage='queued',progress_current=0,

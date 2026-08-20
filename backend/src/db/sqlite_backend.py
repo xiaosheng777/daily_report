@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,9 @@ class SQLiteBackend(DatabaseBackend):
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._maintenance_lock = threading.Lock()
+        self._last_runtime_cleanup_at = 0.0
+        self._last_metrics_cleanup_at = 0.0
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -846,10 +851,21 @@ class SQLiteBackend(DatabaseBackend):
         return self._decode_task(row, include_results=True)
 
     def get_task_status(self, task_id: str, user: User | None = None) -> dict[str, Any] | None:
-        task = self.get_task(task_id, user)
-        if not task:
+        where, values = ["task_id=?"], [task_id]
+        if user:
+            where.append("(created_by=? or trigger_source='system_daily')")
+            values.append(user.user_id)
+        columns = """task_id,created_by,department_id,task_name,task_date,trigger_source,report_date,result_dir,
+            status,error_message,failure_type,created_at,queued_at,started_at,finished_at,heartbeat_at,progress_updated_at,
+            progress_stage,progress_current,progress_total,progress_message,cancel_requested,pause_requested,
+            force_terminate_requested,resume_from_checkpoint,delete_requested,partial_available,
+            attempt_count,current_attempt,summary_json"""
+        with self.connect() as db:
+            row = db.execute("select " + columns + " from check_tasks where " + " and ".join(where), values).fetchone()
+        if not row:
             return None
-        task.pop("result", None); task.pop("config_snapshot", None)
+        task = dict(row)
+        task["summary"] = json.loads(task.pop("summary_json", "{}") or "{}")
         current, total = int(task.get("progress_current") or 0), int(task.get("progress_total") or 0)
         task["progress_percent"] = round(current * 100 / total, 1) if total else 0.0
         started = str(task.get("started_at") or "")
@@ -951,6 +967,7 @@ class SQLiteBackend(DatabaseBackend):
                 (finished_at, max(0, int(duration_ms)), max(0, int(total_duration_ms)), 1 if ok else 0, str(error_type or "")[:80], call_id))
 
     def update_llm_permit_metrics(self, snapshot: dict[str, Any]) -> None:
+        prune_metrics = self._claim_maintenance_slot("_last_metrics_cleanup_at", 3600)
         with self.connect() as db:
             db.execute("""insert into llm_permit_metrics(singleton,updated_at,global_limit,active_total,waiting_total,active_by_task_json,waiting_by_task_json)
                 values (1,?,?,?,?,?,?) on conflict(singleton) do update set updated_at=excluded.updated_at,global_limit=excluded.global_limit,
@@ -960,6 +977,10 @@ class SQLiteBackend(DatabaseBackend):
                 max(0, int(snapshot.get("waiting_total") or 0)), json.dumps(snapshot.get("active_by_task") or {}, ensure_ascii=False),
                 json.dumps(snapshot.get("waiting_by_task") or {}, ensure_ascii=False),
             ))
+            if prune_metrics:
+                cutoff = (datetime.fromisoformat(now_iso()) - timedelta(days=7)).isoformat()
+                db.execute("delete from llm_call_metrics where started_at<?", (cutoff,))
+                db.execute("delete from task_stage_metrics where finished_at<?", (cutoff,))
 
     def resource_monitor_summary(self, retention_days: int = 7) -> dict[str, Any]:
         cutoff = (datetime.fromisoformat(now_iso()) - timedelta(days=max(1, min(30, int(retention_days))))).isoformat()
@@ -978,8 +999,6 @@ class SQLiteBackend(DatabaseBackend):
                 from llm_call_metrics where started_at>=? order by started_at desc limit 2000""", (cutoff,)).fetchall()
             permit_row = db.execute("select * from llm_permit_metrics where singleton=1").fetchone()
             stage_rows = db.execute("select stage,duration_seconds from task_stage_metrics where finished_at>=? order by finished_at desc limit 5000", (cutoff,)).fetchall()
-            db.execute("delete from llm_call_metrics where started_at<?", (cutoff,))
-            db.execute("delete from task_stage_metrics where finished_at<?", (cutoff,))
         counts = {str(row["status"]): int(row["amount"]) for row in count_rows}
         tasks: list[dict[str, Any]] = []
         for row in active_rows:
@@ -1028,7 +1047,14 @@ class SQLiteBackend(DatabaseBackend):
             "oldest_queue_seconds": max([int(item.get("queued_seconds") or 0) for item in tasks if item.get("status") == "queued"] or [0]),
             "recent": {"count": len(recent_rows), "failure_count": failure_count, "average_duration_seconds": round(sum(durations) / len(durations), 1) if durations else 0},
             "stage_p95_seconds": stage_p95,
-            "sqlite": {"latency_ms": sqlite_latency_ms, "size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0},
+            "sqlite": {
+                # A SELECT probe cannot reveal time spent waiting for SQLite's
+                # single writer lock, so do not present it as write latency.
+                "read_latency_ms": sqlite_latency_ms,
+                "latency_ms": sqlite_latency_ms,
+                "size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+                "wal_size_bytes": Path(str(self.db_path) + "-wal").stat().st_size if Path(str(self.db_path) + "-wal").exists() else 0,
+            },
             "llm": {
                 # Call rows begin only when HTTP begins; the Permit Server
                 # snapshot remains the authoritative current-concurrency view.
@@ -1420,6 +1446,14 @@ class SQLiteBackend(DatabaseBackend):
     def _runtime_cutoff() -> str:
         return (shanghai_now() - timedelta(days=7)).replace(tzinfo=None).isoformat(timespec="seconds")
 
+    def _claim_maintenance_slot(self, field: str, interval_seconds: float) -> bool:
+        now = time.monotonic()
+        with self._maintenance_lock:
+            if now - float(getattr(self, field)) < interval_seconds:
+                return False
+            setattr(self, field, now)
+            return True
+
     @staticmethod
     def _decode_runtime_row(row: sqlite3.Row) -> dict[str, Any]:
         try:
@@ -1467,8 +1501,10 @@ class SQLiteBackend(DatabaseBackend):
             "context_json": json.dumps(payload.get("context") or {}, ensure_ascii=False, separators=(",", ":")),
             "traceback_text": str(payload.get("traceback") or ""),
         }
+        prune_logs = self._claim_maintenance_slot("_last_runtime_cleanup_at", 3600)
         with self.connect() as db:
-            db.execute("delete from runtime_logs where occurred_at < ?", (self._runtime_cutoff(),))
+            if prune_logs:
+                db.execute("delete from runtime_logs where occurred_at < ?", (self._runtime_cutoff(),))
             cursor = db.execute(f"insert into runtime_logs({','.join(fields)}) values ({','.join(['?'] * len(fields))})", [values[field] for field in fields])
             row = db.execute("select * from runtime_logs where log_seq=?", (cursor.lastrowid,)).fetchone()
         return self._decode_runtime_row(row)

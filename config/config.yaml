@@ -113,9 +113,16 @@ checks:
   low_information_min_length: 10
   description_too_short_length: 12
   code_history_days: 30
+  code_max_source_bytes: 4194304
+  code_max_tokens: 100000
+  code_max_history_reports: 14
   code_token_similarity_threshold: 0.65
   code_token_high_risk_threshold: 0.85
   document_history_days: 30
+  document_max_characters: 250000
+  document_max_tokens: 40000
+  document_max_history_artifacts: 20
+  comparison_max_tokens: 20000
   document_token_similarity_threshold: 0.65
   document_token_high_risk_threshold: 0.85
   enable_code_check: true

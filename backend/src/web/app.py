@@ -919,7 +919,7 @@ class DailyReportHandler(BaseHTTPRequestHandler):
         if task.get("trigger_source") != "system_daily":
             return task
         summary_for_user = getattr(self.db, "get_task_summary_for_user", None)
-        if callable(summary_for_user) and task.get("partial_available"):
+        if callable(summary_for_user):
             view = dict(task)
             view["summary"] = summary_for_user(task["task_id"], int(task.get("current_attempt") or 1), user)
             return view

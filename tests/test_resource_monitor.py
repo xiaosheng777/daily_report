@@ -111,6 +111,23 @@ def test_sqlite_monitor_migration_progress_and_llm_telemetry(tmp_path: Path):
     assert summary["llm"]["p95_ms"] == 1200
 
 
+def test_resource_monitor_summary_does_not_write_or_prune_metrics(tmp_path: Path, monkeypatch):
+    db = SQLiteBackend(tmp_path / "daily.sqlite3")
+    db.initialize(seed_demo_users=False)
+    statements = []
+    original_connect = db.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db, "connect", traced_connect)
+    db.resource_monitor_summary()
+
+    assert not any(statement.lstrip().lower().startswith("delete") for statement in statements)
+
+
 def test_snapshot_degrades_without_collector_and_invalid_history_range(tmp_path: Path):
     db = SQLiteBackend(tmp_path / "daily.sqlite3")
     db.initialize(seed_demo_users=False)

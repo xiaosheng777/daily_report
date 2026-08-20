@@ -924,6 +924,7 @@ class DailyReportPipeline:
             return CheckResult(checker, True, "unknown", "unknown", summary, [Finding(checker, "unknown", "no_source_files", report.title_summary, reason=summary)])
         history_days = int(self.checks.get("code_history_days", 30))
         history = [candidate for candidate in (self._task_reports_all or self.db.list_reports(None)) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
+        history = sorted(history, key=lambda candidate: (candidate.report_date, candidate.created_at), reverse=True)[:self._history_report_limit("code_max_history_reports", 14)]
         history_with_tokens = [(candidate, *self._code_tokens(candidate)) for candidate in history]
         history_with_tokens = [(candidate, tokens, file_count) for candidate, tokens, file_count in history_with_tokens if tokens]
         if not history_with_tokens:
@@ -950,7 +951,10 @@ class DailyReportPipeline:
             return cached
         allowed = {str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in self.config.get("upload", {}).get("allowed_code_ext", [".zip", ".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs", ".go", ".rs", ".php", ".rb", ".html", ".css"])}
         source_extensions = allowed - {".zip"}
+        max_source_bytes = self._limit("code_max_source_bytes", 4 * 1024 * 1024, 1024)
+        max_tokens = self._limit("code_max_tokens", 100_000, 1_000)
         texts: list[str] = []
+        source_bytes = 0
         for artifact in self._code_artifacts(report):
             name = Path(str(artifact.get("original_filename") or "source")).name
             data = self.storage.read(str(artifact.get("stored_path") or ""))
@@ -962,10 +966,16 @@ class DailyReportPipeline:
                         relative = Path(member.filename)
                         if member.is_dir() or relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in source_extensions:
                             continue
+                        source_bytes += max(0, int(member.file_size))
+                        if source_bytes > max_source_bytes:
+                            raise ValueError(f"代码源码超过 {max_source_bytes // 1024 // 1024} MB 限制")
                         texts.append(archive.read(member).decode("utf-8", errors="replace"))
             elif Path(name).suffix.lower() in source_extensions:
+                source_bytes += len(data)
+                if source_bytes > max_source_bytes:
+                    raise ValueError(f"代码源码超过 {max_source_bytes // 1024 // 1024} MB 限制")
                 texts.append(data.decode("utf-8", errors="replace"))
-        tokens = self._normalize_code_tokens("\n".join(texts))
+        tokens = self._normalize_code_tokens("\n".join(texts), max_tokens)
         result = (tokens, len(texts))
         self._code_token_cache[report.report_id] = result
         return result
@@ -978,13 +988,15 @@ class DailyReportPipeline:
             raise ValueError("ZIP 解压后数据超过 200 MB 限制")
 
     @staticmethod
-    def _normalize_code_tokens(source: str) -> list[str]:
+    def _normalize_code_tokens(source: str, max_tokens: int = 100_000) -> list[str]:
         without_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`', " STR ", source)
         without_comments = re.sub(r"/\*[\s\S]*?\*/|//[^\n]*|#[^\n]*", " ", without_strings)
-        raw_tokens = re.findall(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|==|!=|<=|>=|=>|\+\+|--|&&|\|\||\S", without_comments)
         keywords = {"and", "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "def", "default", "do", "else", "enum", "except", "export", "extends", "finally", "for", "from", "function", "if", "import", "in", "interface", "let", "new", "not", "null", "package", "private", "protected", "public", "return", "static", "struct", "switch", "this", "throw", "try", "true", "false", "undefined", "var", "void", "while", "with", "yield"}
         normalized = []
-        for token in raw_tokens:
+        for match in re.finditer(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|==|!=|<=|>=|=>|\+\+|--|&&|\|\||\S", without_comments):
+            if len(normalized) >= max_tokens:
+                raise ValueError(f"代码 Token 超过 {max_tokens} 个限制")
+            token = match.group(0)
             lowered = token.lower()
             if token == "STR": normalized.append("STR")
             elif re.fullmatch(r"\d+(?:\.\d+)?", token): normalized.append("NUM")
@@ -992,8 +1004,9 @@ class DailyReportPipeline:
             else: normalized.append(token)
         return normalized
 
-    @staticmethod
-    def _code_token_similarity(current_tokens: list[str], history_tokens: list[str]) -> tuple[float, dict[str, float | int]]:
+    def _code_token_similarity(self, current_tokens: list[str], history_tokens: list[str]) -> tuple[float, dict[str, float | int]]:
+        comparison_limit = self._limit("comparison_max_tokens", 20_000, 100)
+        current_tokens, history_tokens = current_tokens[:comparison_limit], history_tokens[:comparison_limit]
         def fingerprints(tokens: list[str]) -> set[tuple[str, ...]]:
             return {tuple(tokens[index:index + 5]) for index in range(max(1, len(tokens) - 4))}
         current_fingerprints, history_fingerprints = fingerprints(current_tokens), fingerprints(history_tokens)
@@ -1158,6 +1171,8 @@ class DailyReportPipeline:
         history_days = int(self.checks.get("document_history_days", 30))
         history = [candidate for candidate in (self._task_reports_all or self.db.list_reports(None)) if candidate.owner_user_id == report.owner_user_id and candidate.report_id != report.report_id and candidate.report_date <= report.report_date and days_between(candidate.report_date, report.report_date) <= history_days]
         historical_artifacts = [(candidate, artifact) for candidate in history for artifact in self._document_artifacts(candidate)]
+        historical_artifacts.sort(key=lambda item: (item[0].report_date, item[0].created_at), reverse=True)
+        historical_artifacts = historical_artifacts[:self._history_report_limit("document_max_history_artifacts", 20)]
         if not historical_artifacts:
             summary = f"未找到近 {history_days} 天可比对的本人历史文档"
             return CheckResult(checker, True, "success", "normal", summary, [Finding(checker, "normal", "no_history", report.title_summary, reason=summary)])
@@ -1245,15 +1260,18 @@ class DailyReportPipeline:
             text = "\n".join(str(cell) for sheet in workbook.worksheets for row in sheet.iter_rows(values_only=True) for cell in row if cell not in (None, ""))
         else:
             text = ""
-        if len(text) > 2_000_000:
-            raise ValueError("文档正文超过 200 万字符限制")
+        max_chars = self._limit("document_max_characters", 250_000, 1_000)
+        if len(text) > max_chars:
+            raise ValueError(f"文档正文超过 {max_chars} 字符限制")
         self._document_text_cache[cache_key] = text
         return text
 
-    @staticmethod
-    def _document_token_similarity(current_text: str, history_text: str) -> tuple[float, dict[str, float | int]]:
-        current_tokens = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[a-zA-Z0-9_]+", normalize_text(current_text))
-        history_tokens = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[a-zA-Z0-9_]+", normalize_text(history_text))
+    def _document_token_similarity(self, current_text: str, history_text: str) -> tuple[float, dict[str, float | int]]:
+        max_tokens = self._limit("document_max_tokens", 40_000, 100)
+        current_tokens = self._document_tokens(current_text, max_tokens)
+        history_tokens = self._document_tokens(history_text, max_tokens)
+        comparison_limit = self._limit("comparison_max_tokens", 20_000, 100)
+        current_tokens, history_tokens = current_tokens[:comparison_limit], history_tokens[:comparison_limit]
         if not current_tokens or not history_tokens:
             return 0.0, {"current_token_count": len(current_tokens), "matched_token_count": 0, "token_overlap": 0.0, "sequence_similarity": 0.0}
         current_set, history_set = set(current_tokens), set(history_tokens)
@@ -1266,6 +1284,24 @@ class DailyReportPipeline:
             "token_overlap": overlap,
             "sequence_similarity": sequence,
         }
+
+    @staticmethod
+    def _document_tokens(text: str, max_tokens: int) -> list[str]:
+        tokens = []
+        for match in re.finditer(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[a-zA-Z0-9_]+", normalize_text(text)):
+            if len(tokens) >= max_tokens:
+                raise ValueError(f"文档 Token 超过 {max_tokens} 个限制")
+            tokens.append(match.group(0))
+        return tokens
+
+    def _limit(self, key: str, default: int, minimum: int) -> int:
+        try:
+            return max(minimum, int(self.checks.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _history_report_limit(self, key: str, default: int) -> int:
+        return self._limit(key, default, 1)
 
     def _run_code_jplag(self, jar_path: Path, current_artifacts: list[dict[str, Any]], history_submissions: list[list[dict[str, Any]]], include_matches: bool = False) -> tuple[float, int, int] | tuple[float, int, int, list[dict[str, Any]]]:
         jplag = self.config.get("jplag", {})

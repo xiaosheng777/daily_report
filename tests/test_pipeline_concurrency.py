@@ -88,6 +88,15 @@ def test_local_worker_count_overrides_legacy_worker_count_and_is_capped_at_thirt
         assert pipeline._local_worker_count() == expected
 
 
+def test_attachment_tokenizers_enforce_configured_hard_limits():
+    pipeline = DailyReportPipeline({"checks": {"code_max_tokens": 3, "document_max_tokens": 3}}, SimpleNamespace(), None)
+
+    with pytest.raises(ValueError, match="代码 Token"):
+        pipeline._normalize_code_tokens("one two three four", 3)
+    with pytest.raises(ValueError, match="文档 Token"):
+        pipeline._document_token_similarity(" ".join(["one"] * 101), "one two")
+
+
 def test_local_checkpoint_survives_mid_phase_crash(monkeypatch):
     source = reports(5)
 

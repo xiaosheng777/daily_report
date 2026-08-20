@@ -1,9 +1,12 @@
 import sqlite3
+import threading
+import time
 
 import pytest
 import yaml
 
-from src.core.task_job import run_task
+from src.core.task_job import AsyncLLMTelemetry, run_task
+from src.db.factory import open_database
 from src.core.pipeline import DailyReportPipeline, TaskPaused
 from src.core.schemas import CheckResult, Report, ReviewCase
 from src.db.factory import create_database
@@ -145,6 +148,57 @@ def test_persisted_task_job_runs_claimed_task_to_completion(tmp_path):
     assert finished["progress_stage"] == "finished"
     assert finished["summary"]["report_count"] == 0
     assert (tmp_path / "storage" / "tasks" / task_id / "attempt_1" / "review_cases.json").exists()
+
+
+def test_task_process_opens_existing_database_without_running_migrations(tmp_path):
+    path = tmp_path / "daily.sqlite3"
+    db = open_database({"database": {"backend": "sqlite", "sqlite_path": str(path)}})
+
+    assert not path.exists()
+    assert db.db_path == path
+
+
+def test_task_status_query_does_not_read_case_results(tmp_path, monkeypatch):
+    db = build_org(tmp_path)
+    leader = as_user(db, "leader1")
+    task_id = db.create_task(leader, {}, {}, "status")
+    claimed = db.claim_next_task("worker-1", "lease-1")
+    db.save_task_case(task_id, claimed["current_attempt"], {"report_id": "r1", "overall_risk": "normal"})
+    statements = []
+    original_connect = db.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db, "connect", traced_connect)
+    status = db.get_task_status(task_id, leader)
+
+    assert status and status["task_id"] == task_id
+    assert "result" not in status
+    assert not any("task_case_results" in statement.lower() for statement in statements)
+
+
+def test_llm_telemetry_queue_never_waits_for_database_write():
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingDatabase:
+        def start_llm_call(self, *_args):
+            started.set()
+            release.wait(1)
+
+        def finish_llm_call(self, *_args):
+            pass
+
+    telemetry = AsyncLLMTelemetry(BlockingDatabase(), "task-1", 1)
+    begun = time.monotonic()
+    telemetry("http_start", {"call_id": "call-1", "started_at": "2026-08-20T00:00:00", "permit_wait_ms": 0})
+
+    assert time.monotonic() - begun < 0.05
+    assert started.wait(1)
+    release.set()
+    telemetry.close()
 
 
 def test_legacy_running_task_is_migrated_and_marked_interrupted(tmp_path):

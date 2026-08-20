@@ -83,6 +83,10 @@ def diagnose(infra: dict, app: dict, history: list[dict], stale_seconds: int) ->
         diagnoses.append(_diagnosis("critical", "io_pressure", "磁盘 I/O 严重拥塞", f"Linux I/O pressure avg10 为 {io_pressure:.1f}%。", "检查大文件读写、SQLite 竞争和其他容器磁盘负载。"))
     elif io_pressure >= 10:
         diagnoses.append(_diagnosis("warning", "io_pressure", "磁盘 I/O 存在等待", f"Linux I/O pressure avg10 为 {io_pressure:.1f}%。", "观察导出、附件解析与查重是否同时执行。"))
+    sqlite = app.get("sqlite") or {}
+    wal_size = int(sqlite.get("wal_size_bytes") or 0)
+    if wal_size >= 1024 ** 3:
+        diagnoses.append(_diagnosis("warning", "sqlite_wal", "SQLite WAL 文件持续偏大", f"WAL 当前为 {wal_size / 1024 ** 2:.0f} MiB。", "检查是否存在长期读事务或写入高峰；确认 checkpoint 能正常推进。"))
     lease = app.get("worker") or {}
     counts = app.get("counts") or {}
     if not lease.get("online"):

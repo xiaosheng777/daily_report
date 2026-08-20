@@ -298,8 +298,7 @@ docker run -d \
   --name daily-report-worker \
   --restart always \
   --network daily-report-net \
-  --cpus 2 \
-  --memory 8g \
+  --memory 64g \
   -v /opt/daily_report/config/config.yaml:/app/backend/config/config.yaml:ro \
   -v /opt/daily_report/config/llm_api_key:/app/backend/config/llm_api_key:ro \
   -v /opt/daily_report/storage:/app/storage \

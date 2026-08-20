@@ -33,6 +33,7 @@ def test_runtime_logs_redact_secrets_filter_and_prune(tmp_path):
 
     with db.connect() as conn:
         conn.execute("insert into runtime_logs(occurred_at,level,source,event,message) values ('2000-01-01T00:00:00','info','web','old','old')")
+    db._last_runtime_cleanup_at = 0
     db.append_runtime_log({"source": "web", "event": "alive", "message": "still running"})
 
     result = db.list_runtime_logs({"source": "task", "task_id": "T_1"})
